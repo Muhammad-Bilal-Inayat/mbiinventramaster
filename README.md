@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 4 slice 4: Staff attendance + payroll (local, not pushed yet)
+## Phase 4 slice 4: Staff attendance + payroll (pushed, commit adb444c)
 
 Advanced only, same rule as slices 1–3. New permissions
 attendance.view / attendance.mark (owner + pharmacist) and payroll.view
