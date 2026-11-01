@@ -1,0 +1,4 @@
+.git
+_archive
+*.zip
+node_modules
