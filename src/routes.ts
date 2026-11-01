@@ -362,6 +362,64 @@ export function buildRouter(store: Store): Router {
     try { return response.json({ purchase: await store.approvePurchase(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase3Error(error, response); }
   });
 
+  // Phase 4 slice 1 — Reports/Export + Branch Transfer. Advanced plan only:
+  // Basic tenants are blocked server-side (403), not just hidden in the UI.
+  // Reports are computed from the same Phase 3 sales/purchases/stock tables,
+  // so report totals must equal the dashboard and the sales list.
+  function requireAdvanced(request: RequestContext, response: Response): boolean {
+    if (request.auth!.plan !== "advanced") { response.status(403).json({ error: "PLAN_NOT_ADVANCED", message: "This module is available on the Advanced plan only." }); return false; }
+    return true;
+  }
+  function mapPhase4Error(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "PHASE4_ERROR";
+    const map: Record<string, number> = { TRANSFER_NOT_FOUND: 404, BATCH_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, SAME_BRANCH_TRANSFER: 400, INVALID_ITEMS: 400, TRANSFER_NOT_PENDING: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    return response.status(map[code] ?? 500).json({ error: code, message: code === "INSUFFICIENT_STOCK" ? "Not enough stock in the source branch for this transfer." : code === "SAME_BRANCH_TRANSFER" ? "Source and destination branches must be different." : "Phase 4 operation failed." });
+  }
+  router.get("/api/reports/sales", requirePermission("reports.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const filters = { from: typeof request.query.from === "string" ? request.query.from : undefined, to: typeof request.query.to === "string" ? request.query.to : undefined, branchId: typeof request.query.branchId === "string" ? request.query.branchId : undefined };
+    if (filters.branchId && !branchAccess(request, filters.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    return response.json({ report: await store.getSalesReport(request.auth!.tenantId, filters) });
+  });
+  router.get("/api/reports/sales/export", requirePermission("reports.export"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const filters = { from: typeof request.query.from === "string" ? request.query.from : undefined, to: typeof request.query.to === "string" ? request.query.to : undefined, branchId: typeof request.query.branchId === "string" ? request.query.branchId : undefined };
+    if (filters.branchId && !branchAccess(request, filters.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    const report = await store.getSalesReport(request.auth!.tenantId, filters);
+    const escapeCsv = (value: unknown) => '"' + String(value ?? "").replace(/"/g, '""') + '"';
+    const lines = ["invoice_no,branch_id,total,paid_amount,balance_due,payment_type,status,created_at"];
+    for (const sale of report.sales) lines.push([sale.invoiceNo, sale.branchId, sale.total, sale.paidAmount, sale.balanceDue, sale.paymentType, sale.status, sale.createdAt].map(escapeCsv).join(","));
+    lines.push("");
+    lines.push(["TOTAL_SALES", "", report.totalSales, "", "", "", "", ""].map(escapeCsv).join(","));
+    response.setHeader("content-type", "text/csv; charset=utf-8");
+    response.setHeader("content-disposition", "attachment; filename=sales-report.csv");
+    return response.send(lines.join("\n"));
+  });
+  router.get("/api/transfers", requirePermission("transfers.request"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    return response.json({ transfers: await store.listTransfers(request.auth!.tenantId) });
+  });
+  router.post("/api/transfers", requirePermission("transfers.request"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const body = z.object({ medicineId: z.string().min(1), batchId: z.string().min(1), fromBranchId: z.string().min(1), toBranchId: z.string().min(1), quantity: z.number().int().positive() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!branchAccess(request, body.data.fromBranchId) || !branchAccess(request, body.data.toBranchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.status(201).json({ transfer: await store.createTransfer(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapPhase4Error(error, response); }
+  });
+  router.post("/api/transfers/:id/approve", requirePermission("transfers.approve"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const existing = (await store.listTransfers(request.auth!.tenantId)).find((x) => x.id === String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "TRANSFER_NOT_FOUND" });
+    if (!branchAccess(request, existing.fromBranchId) || !branchAccess(request, existing.toBranchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ transfer: await store.approveTransfer(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase4Error(error, response); }
+  });
+  router.post("/api/transfers/:id/reject", requirePermission("transfers.approve"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const existing = (await store.listTransfers(request.auth!.tenantId)).find((x) => x.id === String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "TRANSFER_NOT_FOUND" });
+    try { return response.json({ transfer: await store.rejectTransfer(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase4Error(error, response); }
+  });
+
   // Phase 0 honesty fix: sync health must not return a random cursor, and
   // sync push must not pretend a record was saved when it was not.
   // Cursor-based offline sync storage lands in Phase 6. Until then, clients

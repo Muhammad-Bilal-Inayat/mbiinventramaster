@@ -80,6 +80,30 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 4 slice 1: Reports/Export + Branch Transfer (local, not pushed yet)
+
+Phase 4 is 7 modules, so it is built in slices, not all at once — this slice
+is the one that syncs directly with Phase 3 data. Remaining Phase 4 modules
+(prescriptions, controlled drugs, full accounting, online store, staff
+attendance/payroll) are NOT built yet and stay Coming soon.
+- Reports: GET /api/reports/sales (reports.view) with ?from=&to=&branchId=.
+  Totals come from the same sales/purchases/stock tables as Phase 3, so
+  report total = dashboard revenue = sales list total. Profit = sales minus
+  batch purchase cost. CSV: GET /api/reports/sales/export (reports.export,
+  downloaded with the session token, not a bare link).
+- Transfers: POST /api/transfers (transfers.request) creates a PENDING
+  transfer — no stock moves. POST /api/transfers/:id/approve
+  (transfers.approve) moves stock source -> destination in one MariaDB
+  transaction (source stock re-checked, insufficient = 400, no partial move);
+  reject moves nothing; double approve = 409; same-branch = 400.
+- Advanced-only: both reports and transfers return 403 PLAN_NOT_ADVANCED
+  for Basic tenants, server-side, not just hidden in the UI.
+- Frontend: Reports nav page is now real (filters, summary, branch/top
+  products, CSV download, transfer request/approve/reject). Branches,
+  Devices, Sync, Settings stay Coming soon.
+- Tables: db/migrations/006_tenant_reports_transfers.sql (tenant DBs only),
+  also auto-created on first use.
+
 ## Phase 3: POS, Purchases, Khata (pushed, commit 94c4fcf)
 
 - POS sale: POST /api/sales (permission sales.create, branch access).

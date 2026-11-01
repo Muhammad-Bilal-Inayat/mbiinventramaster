@@ -229,8 +229,54 @@ async function renderPurchases() {
   });
 }
 
+
+async function renderReports() {
+  const branches = state.me.tenant.branches.map(b => '<option value="' + b.id + '">' + b.name + '</option>').join('');
+  document.querySelector('#mainContent').innerHTML =
+    '<div class="topbar"><div><div class="eyebrow">REPORTS & TRANSFERS — ADVANCED ONLY</div><h1 class="headline">Reports & branch transfers</h1><p class="subhead">Reports Phase 3 ki sales, purchases aur stock se hi bante hain, is liye report ka total dashboard aur sales list se match karna chahiye. Basic plan par ye page server se block hai.</p></div></div>' +
+    '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">Sales report</h2></div><div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><input id="repFrom" type="date" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input id="repTo" type="date" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select id="repBranch" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="">All branches</option>' + branches + '</select><button class="btn primary" id="repLoad">Load report</button><button class="btn" id="repCsv">Export CSV</button></div><div id="repResult"><p>Load a report to see real totals.</p></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Branch transfer</h2></div><form id="transferForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="medicineId" placeholder="Medicine ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="batchId" placeholder="Batch ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select name="fromBranchId" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><select name="toBranchId" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><input name="quantity" type="number" step="1" min="1" placeholder="Qty *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Request transfer</button></form><p style="font-size:12px;color:#627d98">Request par stock nahi hilta. Approve par source branch se stock kam aur destination par zyada hota hai, aik transaction me. Reject par kuch nahi hota.</p><div id="transferList" style="margin-top:12px"><p>Loading...</p></div></section>';
+  async function loadReport() {
+    const from = document.querySelector('#repFrom').value; const to = document.querySelector('#repTo').value; const branchId = document.querySelector('#repBranch').value;
+    const q = new URLSearchParams(); if (from) q.set('from', from); if (to) q.set('to', to); if (branchId) q.set('branchId', branchId);
+    try {
+      const data = await api('/api/reports/sales?' + q.toString());
+      const r = data.report; const box = document.querySelector('#repResult');
+      box.innerHTML = '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px"><div><strong>Total sales</strong><div>' + money(r.totalSales) + '</div></div><div><strong>Total purchases (approved)</strong><div>' + money(r.totalPurchases) + '</div></div><div><strong>Profit</strong><div>' + money(r.profit) + '</div></div></div>' +
+        '<p>Sales: ' + r.salesCount + ' - Purchases: ' + r.purchaseCount + '</p>' +
+        '<h3>By branch</h3>' + r.byBranch.map(b => '<div class="activity"><div><strong>' + b.branchId + '</strong><span>' + money(b.sales) + ' - ' + b.orders + ' orders</span></div></div>').join('') +
+        '<h3>Top products</h3>' + r.topProducts.map(t => '<div class="activity"><div><strong>' + t.name + '</strong><span>' + t.units + ' units - ' + money(t.revenue) + '</span></div></div>').join('');
+    } catch (e) { const box = document.querySelector('#repResult'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  document.querySelector('#repLoad').addEventListener('click', loadReport);
+  document.querySelector('#repCsv').addEventListener('click', async () => {
+    const from = document.querySelector('#repFrom').value; const to = document.querySelector('#repTo').value; const branchId = document.querySelector('#repBranch').value;
+    const q = new URLSearchParams(); if (from) q.set('from', from); if (to) q.set('to', to); if (branchId) q.set('branchId', branchId);
+    try {
+      const response = await fetch('/api/reports/sales/export?' + q.toString(), { headers: { authorization: 'Bearer ' + state.token } });
+      if (!response.ok) throw new Error('Export failed');
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'sales-report.csv'; a.click(); URL.revokeObjectURL(url);
+    } catch (e) { alert(e.message); }
+  });
+  async function loadTransfers() {
+    try {
+      const data = await api('/api/transfers');
+      const box = document.querySelector('#transferList'); if (!box) return;
+      if (!data.transfers.length) { box.innerHTML = '<p>No transfers yet.</p>'; return; }
+      box.innerHTML = data.transfers.slice(0, 20).map(x => '<div class="activity"><div><strong>' + x.batchNo + ' - ' + x.quantity + ' units - ' + x.status + '</strong><span>' + x.fromBranchId + ' to ' + x.toBranchId + '</span></div>' + (x.status === 'pending' ? '<button class="btn primary" data-approve="' + x.id + '">Approve</button><button class="btn" data-reject="' + x.id + '">Reject</button>' : '') + '</div>').join('');
+      box.querySelectorAll('[data-approve]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/transfers/' + btn.dataset.approve + '/approve', { method: 'POST', body: JSON.stringify({}) }); loadTransfers(); } catch (err) { alert(err.message); } }));
+      box.querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/transfers/' + btn.dataset.reject + '/reject', { method: 'POST', body: JSON.stringify({}) }); loadTransfers(); } catch (err) { alert(err.message); } }));
+    } catch (e) { const box = document.querySelector('#transferList'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  loadTransfers();
+  document.querySelector('#transferForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); f.quantity = Number(f.quantity); try { await api('/api/transfers', { method: 'POST', body: JSON.stringify(f) }); loadTransfers(); } catch (err) { alert(err.message); } });
+  loadReport();
+}
+
 function bindApp() {
-  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
+  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key === 'report') { renderReports(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
   document.querySelector('#refresh')?.addEventListener('click', async () => { state.dashboard = await api('/api/dashboard'); document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); const toast = document.querySelector('#toast'); toast.textContent = 'Dashboard refreshed.'; toast.style.display = 'block'; setTimeout(() => { toast.style.display = 'none'; }, 2600); });
   document.querySelector('#resetLayout')?.addEventListener('click', async () => { try { const r = await api('/api/home/layout', { method: 'POST', body: JSON.stringify({ layout: ["kpis", "branch", "alerts", "top", "activity", "command"] }) }); state.homeLayout = r.layout; document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); } catch (error) { alert(error.message); } });
   document.querySelectorAll('[data-widget]').forEach(el => {

@@ -109,6 +109,29 @@ export interface PurchaseRecord {
   createdAt: string;
 }
 
+export interface SalesReport {
+  totalSales: number;
+  totalPurchases: number;
+  profit: number;
+  salesCount: number;
+  purchaseCount: number;
+  byBranch: Array<{ branchId: string; sales: number; orders: number }>;
+  topProducts: Array<{ name: string; units: number; revenue: number }>;
+  sales: SaleRecord[];
+}
+
+export interface TransferRecord {
+  id: string;
+  medicineId: string;
+  batchId: string;
+  batchNo: string;
+  fromBranchId: string;
+  toBranchId: string;
+  quantity: number;
+  status: "pending" | "approved" | "rejected";
+  createdAt: string;
+}
+
 export interface KhataEntryRecord {
   id: string;
   partyId: string;
@@ -194,6 +217,11 @@ export interface Store {
   createPurchase(tenantId: string, userId: string, input: { branchId: string; supplierId: string; items: Array<{ medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number; quantity: number }>; paidAmount: number; approved: boolean }): Promise<PurchaseRecord>;
   listPurchases(tenantId: string): Promise<PurchaseRecord[]>;
   approvePurchase(tenantId: string, userId: string, purchaseId: string): Promise<PurchaseRecord>;
+  getSalesReport(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<SalesReport>;
+  createTransfer(tenantId: string, userId: string, input: { medicineId: string; batchId: string; fromBranchId: string; toBranchId: string; quantity: number }): Promise<TransferRecord>;
+  listTransfers(tenantId: string): Promise<TransferRecord[]>;
+  approveTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
+  rejectTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
 }
 
 const ownerPermissions: PermissionCode[] = [
@@ -315,6 +343,7 @@ class MemoryStore implements Store {
   private khata: KhataEntryRecord[] = [];
   private saleSeq = 0;
   private purchaseSeq = 0;
+  private transfers = new Map<string, TransferRecord & { tenantId: string }>();
   private partyToRecord(party: PartyRecord & { tenantId: string }): PartyRecord {
     const { tenantId: _t, ...rest } = party; return rest;
   }
@@ -607,6 +636,68 @@ class MemoryStore implements Store {
     purchase.status = "approved";
     this.applyPurchaseStock(tenantId, purchase);
     return this.purchaseToRecord(purchase);
+  }
+  async getSalesReport(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<SalesReport> {
+    const inRange = (createdAt: string) => {
+      const d = createdAt.slice(0, 10);
+      if (filters.from && d < filters.from) return false;
+      if (filters.to && d > filters.to) return false;
+      return true;
+    };
+    const sales = [...this.sales.values()].filter((x) => x.tenantId === tenantId && inRange(x.createdAt) && (!filters.branchId || x.branchId === filters.branchId));
+    const purchases = [...this.purchases.values()].filter((x) => x.tenantId === tenantId && inRange(x.createdAt) && (!filters.branchId || x.branchId === filters.branchId));
+    const totalSales = sales.reduce((sum, x) => sum + x.total, 0);
+    const totalPurchases = purchases.filter((x) => x.status === "approved").reduce((sum, x) => sum + x.subtotal, 0);
+    const cost = sales.flatMap((x) => x.items).reduce((sum, i) => sum + i.quantity * (this.batches.get(i.batchId)?.purchasePrice ?? 0), 0);
+    const branchMap = new Map<string, { branchId: string; sales: number; orders: number }>();
+    for (const sale of sales) {
+      const entry = branchMap.get(sale.branchId) ?? { branchId: sale.branchId, sales: 0, orders: 0 };
+      entry.sales += sale.total; entry.orders += 1; branchMap.set(sale.branchId, entry);
+    }
+    const productMap = new Map<string, { name: string; units: number; revenue: number }>();
+    for (const sale of sales) for (const item of sale.items) {
+      const med = this.medicines.get(item.medicineId);
+      const entry = productMap.get(item.medicineId) ?? { name: med?.name ?? item.medicineId, units: 0, revenue: 0 };
+      const netRatio = sale.subtotal > 0 ? (1 - sale.discount / sale.subtotal) : 1;
+      entry.units += item.quantity; entry.revenue += item.quantity * item.unitPrice * netRatio; productMap.set(item.medicineId, entry);
+    }
+    return { totalSales, totalPurchases, profit: totalSales - cost, salesCount: sales.length, purchaseCount: purchases.length, byBranch: [...branchMap.values()], topProducts: [...productMap.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 10), sales: sales.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => this.saleToRecord(x)) };
+  }
+  async createTransfer(tenantId: string, _userId: string, input: { medicineId: string; batchId: string; fromBranchId: string; toBranchId: string; quantity: number }) {
+    if (input.fromBranchId === input.toBranchId) throw new Error("SAME_BRANCH_TRANSFER");
+    if (!(input.quantity > 0)) throw new Error("INVALID_ITEMS");
+    const batch = this.batches.get(input.batchId);
+    if (!batch || batch.tenantId !== tenantId || batch.medicineId !== input.medicineId) throw new Error("BATCH_NOT_FOUND");
+    const transfer: TransferRecord & { tenantId: string } = { id: randomId("transfer"), tenantId, medicineId: input.medicineId, batchId: input.batchId, batchNo: batch.batchNo, fromBranchId: input.fromBranchId, toBranchId: input.toBranchId, quantity: input.quantity, status: "pending", createdAt: new Date().toISOString() };
+    this.transfers.set(transfer.id, transfer);
+    const { tenantId: _t, ...rest } = transfer; return rest;
+  }
+  async listTransfers(tenantId: string) {
+    return [...this.transfers.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => { const { tenantId: _t, ...rest } = x; return rest; });
+  }
+  async approveTransfer(tenantId: string, _userId: string, transferId: string) {
+    const transfer = this.transfers.get(transferId);
+    if (!transfer || transfer.tenantId !== tenantId) throw new Error("TRANSFER_NOT_FOUND");
+    if (transfer.status !== "pending") throw new Error("TRANSFER_NOT_PENDING");
+    const fromKey = `${transfer.fromBranchId}:${transfer.batchId}`;
+    const fromRow = this.stock.get(fromKey);
+    if (!fromRow || fromRow.quantity < transfer.quantity) throw new Error("INSUFFICIENT_STOCK");
+    fromRow.quantity -= transfer.quantity; this.stock.set(fromKey, fromRow);
+    const toKey = `${transfer.toBranchId}:${transfer.batchId}`;
+    const toRow = this.stock.get(toKey) ?? { quantity: 0, reorderLevel: fromRow.reorderLevel }; toRow.quantity += transfer.quantity; this.stock.set(toKey, toRow);
+    this.movementSeq += 1;
+    this.movements.push({ id: randomId("movement"), branchId: transfer.fromBranchId, batchId: transfer.batchId, movementType: "transfer", quantity: -transfer.quantity, referenceId: transfer.id, idempotencyKey: `transfer-out-${transfer.id}`, serverVersion: this.movementSeq });
+    this.movementSeq += 1;
+    this.movements.push({ id: randomId("movement"), branchId: transfer.toBranchId, batchId: transfer.batchId, movementType: "transfer", quantity: transfer.quantity, referenceId: transfer.id, idempotencyKey: `transfer-in-${transfer.id}`, serverVersion: this.movementSeq });
+    transfer.status = "approved";
+    const { tenantId: _t, ...rest } = transfer; return rest;
+  }
+  async rejectTransfer(tenantId: string, _userId: string, transferId: string) {
+    const transfer = this.transfers.get(transferId);
+    if (!transfer || transfer.tenantId !== tenantId) throw new Error("TRANSFER_NOT_FOUND");
+    if (transfer.status !== "pending") throw new Error("TRANSFER_NOT_PENDING");
+    transfer.status = "rejected";
+    const { tenantId: _t, ...rest } = transfer; return rest;
   }
 }
 
@@ -1109,6 +1200,87 @@ class MariaDbHealthStore implements Store {
     } catch (error) {
       await connection.rollback().catch(() => undefined); throw error;
     } finally { connection.release(); }
+  }
+  private async ensurePhase4Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS transfers (id VARCHAR(96) PRIMARY KEY, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, batch_no VARCHAR(96) NOT NULL, from_branch_id VARCHAR(96) NOT NULL, to_branch_id VARCHAR(96) NOT NULL, quantity INT NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'pending', created_by VARCHAR(96) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_transfer_status (status)) ENGINE=InnoDB");
+  }
+  async getSalesReport(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<SalesReport> {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filters.from) { where.push("DATE(created_at) >= ?"); params.push(filters.from); }
+    if (filters.to) { where.push("DATE(created_at) <= ?"); params.push(filters.to); }
+    if (filters.branchId) { where.push("branch_id = ?"); params.push(filters.branchId); }
+    const clause = where.length ? " WHERE " + where.join(" AND ") : "";
+    const salesRows = await tenantPool.query(`SELECT COALESCE(SUM(total), 0) AS totalSales, COUNT(*) AS salesCount FROM sales${clause}`, params) as any[];
+    const purClause = where.length ? clause + " AND status = 'approved'" : " WHERE status = 'approved'";
+    const purRows = await tenantPool.query(`SELECT COALESCE(SUM(subtotal), 0) AS totalPurchases, COUNT(*) AS purchaseCount FROM purchases${purClause}`, params) as any[];
+    const costRows = await tenantPool.query("SELECT COALESCE(SUM(si.quantity * b.purchase_price), 0) AS cost FROM sale_items si JOIN medicine_batches b ON b.id = si.batch_id JOIN sales s ON s.id = si.sale_id" + (where.length ? " WHERE " + where.map((w) => w.replace("created_at", "s.created_at").replace("branch_id", "s.branch_id")).join(" AND ") : ""), params) as any[];
+    const branchRows = await tenantPool.query(`SELECT branch_id AS branchId, COALESCE(SUM(total), 0) AS sales, COUNT(*) AS orders FROM sales${clause} GROUP BY branch_id`, params) as any[];
+    const topRows = await tenantPool.query("SELECT m.name AS name, SUM(si.quantity) AS units, SUM(si.quantity * si.unit_price * (1 - CASE WHEN s.subtotal > 0 THEN s.discount / s.subtotal ELSE 0 END)) AS revenue FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN medicines m ON m.id = si.medicine_id" + (where.length ? " WHERE " + where.map((w) => w.replace("created_at", "s.created_at").replace("branch_id", "s.branch_id")).join(" AND ") : "") + " GROUP BY m.id ORDER BY revenue DESC LIMIT 10", params) as any[];
+    const saleIds = await tenantPool.query(`SELECT id FROM sales${clause} ORDER BY created_at DESC LIMIT 200`, params) as any[];
+    const sales: SaleRecord[] = [];
+    for (const r of saleIds) { const sale = await this.loadSale(tenantPool, r.id); if (sale) sales.push(sale); }
+    return { totalSales: Number(salesRows[0]?.totalSales ?? 0), totalPurchases: Number(purRows[0]?.totalPurchases ?? 0), profit: Number(salesRows[0]?.totalSales ?? 0) - Number(costRows[0]?.cost ?? 0), salesCount: Number(salesRows[0]?.salesCount ?? 0), purchaseCount: Number(purRows[0]?.purchaseCount ?? 0), byBranch: branchRows.map((r: any) => ({ branchId: r.branchId, sales: Number(r.sales), orders: Number(r.orders) })), topProducts: topRows.map((r: any) => ({ name: r.name, units: Number(r.units), revenue: Number(r.revenue) })), sales };
+  }
+  async createTransfer(tenantId: string, userId: string, input: { medicineId: string; batchId: string; fromBranchId: string; toBranchId: string; quantity: number }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Tables(tenantPool);
+    if (input.fromBranchId === input.toBranchId) throw new Error("SAME_BRANCH_TRANSFER");
+    if (!(input.quantity > 0)) throw new Error("INVALID_ITEMS");
+    const batches = await tenantPool.query("SELECT batch_no AS batchNo FROM medicine_batches WHERE id = ? AND medicine_id = ? LIMIT 1", [input.batchId, input.medicineId]) as any[];
+    if (!batches.length) throw new Error("BATCH_NOT_FOUND");
+    const id = randomId("transfer");
+    await tenantPool.query("INSERT INTO transfers (id, medicine_id, batch_id, batch_no, from_branch_id, to_branch_id, quantity, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)", [id, input.medicineId, input.batchId, batches[0].batchNo, input.fromBranchId, input.toBranchId, input.quantity, userId]);
+    return { id, medicineId: input.medicineId, batchId: input.batchId, batchNo: batches[0].batchNo, fromBranchId: input.fromBranchId, toBranchId: input.toBranchId, quantity: input.quantity, status: "pending" as const, createdAt: new Date().toISOString() };
+  }
+  async listTransfers(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id, medicine_id AS medicineId, batch_id AS batchId, batch_no AS batchNo, from_branch_id AS fromBranchId, to_branch_id AS toBranchId, quantity, status, created_at AS createdAt FROM transfers ORDER BY created_at DESC LIMIT 200") as any[];
+    return rows.map((r: any) => ({ id: r.id, medicineId: r.medicineId, batchId: r.batchId, batchNo: r.batchNo, fromBranchId: r.fromBranchId, toBranchId: r.toBranchId, quantity: Number(r.quantity), status: r.status, createdAt: String(r.createdAt) }));
+  }
+  private async loadTransfer(tenantPool: any, transferId: string) {
+    const rows = await tenantPool.query("SELECT id, medicine_id AS medicineId, batch_id AS batchId, batch_no AS batchNo, from_branch_id AS fromBranchId, to_branch_id AS toBranchId, quantity, status, created_at AS createdAt FROM transfers WHERE id = ? LIMIT 1", [transferId]) as any[];
+    const r = rows[0]; if (!r) return undefined;
+    return { id: r.id, medicineId: r.medicineId, batchId: r.batchId, batchNo: r.batchNo, fromBranchId: r.fromBranchId, toBranchId: r.toBranchId, quantity: Number(r.quantity), status: r.status, createdAt: String(r.createdAt) };
+  }
+  async approveTransfer(tenantId: string, userId: string, transferId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Tables(tenantPool);
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const transfer = await this.loadTransfer(connection, transferId);
+      if (!transfer) throw new Error("TRANSFER_NOT_FOUND");
+      if (transfer.status !== "pending") throw new Error("TRANSFER_NOT_PENDING");
+      const stockRows = await connection.query("SELECT quantity, reorder_level AS reorderLevel FROM branch_stock WHERE branch_id = ? AND batch_id = ? FOR UPDATE", [transfer.fromBranchId, transfer.batchId]) as any[];
+      const avail = stockRows.length ? Number(stockRows[0].quantity) : 0;
+      if (avail < transfer.quantity) throw new Error("INSUFFICIENT_STOCK");
+      await connection.query("UPDATE branch_stock SET quantity = quantity - ? WHERE branch_id = ? AND batch_id = ?", [transfer.quantity, transfer.fromBranchId, transfer.batchId]);
+      await connection.query("INSERT INTO branch_stock (branch_id, batch_id, quantity, reserved_quantity, reorder_level) VALUES (?, ?, ?, 0, ?) ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)", [transfer.toBranchId, transfer.batchId, transfer.quantity, stockRows.length ? Number(stockRows[0].reorderLevel) : 0]);
+      await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'transfer', ?, ?, ?, 0, ?)", [randomId("movement"), transfer.fromBranchId, transfer.batchId, -transfer.quantity, transferId, `transfer-out-${transferId}`, userId]);
+      await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'transfer', ?, ?, ?, 0, ?)", [randomId("movement"), transfer.toBranchId, transfer.batchId, transfer.quantity, transferId, `transfer-in-${transferId}`, userId]);
+      await connection.query("UPDATE transfers SET status = 'approved' WHERE id = ?", [transferId]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'transfer.approve', 'transfer', ?, ?)", [userId, transferId, JSON.stringify({ status: "approved" })]);
+      await connection.commit();
+      const updated = await this.loadTransfer(tenantPool, transferId);
+      return updated!;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async rejectTransfer(tenantId: string, userId: string, transferId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Tables(tenantPool);
+    const transfer = await this.loadTransfer(tenantPool, transferId);
+    if (!transfer) throw new Error("TRANSFER_NOT_FOUND");
+    if (transfer.status !== "pending") throw new Error("TRANSFER_NOT_PENDING");
+    await tenantPool.query("UPDATE transfers SET status = 'rejected' WHERE id = ?", [transferId]);
+    await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'transfer.reject', 'transfer', ?, ?)", [userId, transferId, JSON.stringify({ status: "rejected" })]);
+    const updated = await this.loadTransfer(tenantPool, transferId);
+    return updated!;
   }
 }
 
