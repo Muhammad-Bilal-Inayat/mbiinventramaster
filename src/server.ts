@@ -17,7 +17,19 @@ const publicDir = path.resolve(__dirname, "../public");
 
 app.disable("x-powered-by");
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: true, credentials: true }));
+// CORS: never reflect any origin in production. Same-origin PWA requests
+// do not need CORS. Set CORS_ORIGIN to a comma-separated allow-list for
+// any separate frontend origin. Localhost is allowed only outside production.
+const allowedOrigins = (process.env.CORS_ORIGIN || "").split(",").map((o) => o.trim()).filter(Boolean);
+app.use(cors({
+  credentials: true,
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (process.env.NODE_ENV !== "production" && origin.startsWith("http://localhost:")) return callback(null, true);
+    return callback(new Error("CORS origin not allowed"));
+  },
+}));
 app.use(compression());
 app.use(express.json({ limit: "2mb" }));
 app.use((request, response, next) => { response.setHeader("x-content-type-options", "nosniff"); response.setHeader("x-frame-options", "SAMEORIGIN"); next(); });

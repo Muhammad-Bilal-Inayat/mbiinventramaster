@@ -72,7 +72,7 @@ class MemoryStore implements Store {
     if (this.tenants.size) return;
     const tenant: TenantRecord = {
       id: "tenant_demo",
-      name: "PharmaFlow Demo Group",
+      name: "MBI Inventra Demo",
       plan: "advanced",
       status: "active",
       branches: [

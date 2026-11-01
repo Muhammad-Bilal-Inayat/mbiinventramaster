@@ -32,12 +32,15 @@ export interface PlanDefinition {
   aiQuota: number;
 }
 
+// Device limit is fixed at 3 per tenant for every plan (Phase 0 rule R3,
+// from the original tenant spec). It is not a plan upsell: Basic 2 and
+// Advanced 15 in the old foundation were demo values and are corrected here.
 export const plans: Record<PlanId, PlanDefinition> = {
   basic: {
     id: "basic",
     name: "Basic",
     description: "Daily pharmacy operations with offline PWA and safe sync.",
-    limits: { users: 2, devices: 2, branches: 2 },
+    limits: { users: 2, devices: 3, branches: 2 },
     aiQuota: 20,
     modules: ["Dashboard", "POS & Sales", "Purchases", "Inventory", "Khata", "Reports", "Offline PWA"],
   },
@@ -45,7 +48,7 @@ export const plans: Record<PlanId, PlanDefinition> = {
     id: "advanced",
     name: "Advanced",
     description: "Full multi-branch SaaS command center for growing pharmacy groups.",
-    limits: { users: 15, devices: 15, branches: 10 },
+    limits: { users: 15, devices: 3, branches: 10 },
     aiQuota: 300,
     modules: [
       "All Basic modules",

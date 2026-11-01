@@ -3,7 +3,15 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 import type { PermissionCode, PlanId } from "./catalog.js";
 
-const jwtSecret = process.env.JWT_SECRET || "local-development-only-change-me";
+const jwtSecret = (() => {
+  const secret = process.env.JWT_SECRET;
+  if (secret) return secret;
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET is required in production. Set it in .env before starting the server.");
+  }
+  console.warn("WARNING: JWT_SECRET is not set. Using a local-development-only secret. Never use this in production.");
+  return "local-development-only-change-me";
+})();
 
 export interface AccessClaims extends jwt.JwtPayload {
   sub: string;
