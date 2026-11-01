@@ -130,13 +130,14 @@ export function buildRouter(store: Store): Router {
     if (hits.length >= 10) return response.status(429).json({ error: "RATE_LIMITED", message: "Too many registrations from this address. Try again later." });
     hits.push(now); publicRegisterHits.set(ip, hits);
     const body = z.object({ name: z.string().min(2).max(160), ownerName: z.string().min(2).max(160), ownerLogin: z.string().min(2).max(160), ownerPassword: z.string().min(8).max(200), branchName: z.string().min(2).max(160), branchCity: z.string().max(120).optional() }).safeParse(request.body);
-    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", message: "Please fill all required fields: pharmacy name, owner name, login, password (min 8 characters) and branch name.", issues: body.error.flatten() });
     try {
       const result = await provisionTenant({ ...body.data, plan: "basic" });
       return response.status(201).json({ tenant: { id: result.tenantId, name: body.data.name, databaseName: result.databaseName, plan: "basic" }, ownerLogin: body.data.ownerLogin });
     } catch (error) {
       const code = error instanceof Error ? error.message : "REGISTER_FAILED";
       if (code === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: code });
+      if (code === "LOGIN_ALREADY_EXISTS") return response.status(409).json({ error: code, message: "This login already exists. Please sign in with it, or register with a different login." });
       return response.status(503).json({ error: "REGISTER_FAILED", message: "Registration failed. The database or provisioning step did not complete." });
     }
   });
@@ -242,6 +243,7 @@ export function buildRouter(store: Store): Router {
       // Never leak database error details (host, user, or SQL) to the client.
       const message = error instanceof Error ? error.message : "PROVISION_FAILED";
       if (message === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: message });
+      if (message === "LOGIN_ALREADY_EXISTS") return response.status(409).json({ error: message, message: "This login already exists. Use a different owner login." });
       if (message === "INVALID_PLAN") return response.status(400).json({ error: message });
       return response.status(503).json({ error: "PROVISION_FAILED", message: "Tenant provisioning failed. Check the server database configuration and try again." });
     }

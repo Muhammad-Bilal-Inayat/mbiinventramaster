@@ -61,15 +61,35 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
   const masterPool = mariadb.createPool(mariadbConfig(process.env.MARIADB_DATABASE || "master_control"));
   let tenantPool: ReturnType<typeof mariadb.createPool> | null = null;
   try {
-    // Next tenant number from the master registry, not from the client.
-    const countRows = (await masterPool.query("SELECT COUNT(*) AS c FROM tenants")) as any[];
-    const next = Number(countRows[0]?.c ?? 0) + 1;
+    // Login must be unique across ALL tenants (tenant_user_index.login is
+    // UNIQUE). Check first, before any database is created, so a duplicate
+    // login can never leave an orphan tenant database behind. This was the
+    // registration failure users saw as a generic 503: the index insert at
+    // step 4 failed, after the tenant database was already seeded.
+    const loginRows = (await masterPool.query("SELECT user_id FROM tenant_user_index WHERE login = ? LIMIT 1", [input.ownerLogin])) as any[];
+    if (loginRows.length) throw new Error("LOGIN_ALREADY_EXISTS");
+
+    // Next tenant number: never COUNT-based. COUNT breaks when a tenant row
+    // was deleted, or when a failed provision left an orphan database behind
+    // — a retry would reuse the same number and die on the already-seeded
+    // users/ai_credits rows. Pick the first number whose master row AND
+    // whose database both do not exist yet.
+    let existingSchemas = new Set<string>();
+    try {
+      const schemaRows = (await masterPool.query("SELECT SCHEMA_NAME AS name FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE 'tenant\\_%'")) as any[];
+      existingSchemas = new Set(schemaRows.map((r: any) => String(r.name)));
+    } catch { /* schema listing is best-effort; the master-row check still applies */ }
+    let next = 1;
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const candidate = `tenant_${String(next).padStart(6, "0")}`;
+      const rowExists = (await masterPool.query("SELECT id FROM tenants WHERE id = ? LIMIT 1", [candidate])) as any[];
+      if (!rowExists.length && !existingSchemas.has(candidate)) break;
+      next += 1;
+      if (attempt === 999) throw new Error("TENANT_NUMBER_EXHAUSTED");
+    }
     const databaseName = `tenant_${String(next).padStart(6, "0")}`;
     const tenantId = databaseName;
     if (!isValidDatabaseName(databaseName)) throw new Error("INVALID_DATABASE_NAME");
-
-    const existing = (await masterPool.query("SELECT id FROM tenants WHERE id = ? LIMIT 1", [tenantId])) as any[];
-    if (existing.length) throw new Error("TENANT_ALREADY_EXISTS");
 
     // 1. Create the tenant database. Identifier is server-generated and
     // validated above, so backtick quoting here is safe.
@@ -124,24 +144,36 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
     await tenantPool.query("CREATE TABLE IF NOT EXISTS home_layout (id INT PRIMARY KEY, layout_json JSON NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     await tenantPool.query("CREATE TABLE IF NOT EXISTS ai_credits (id INT PRIMARY KEY, credits_total INT NOT NULL, credits_used INT NOT NULL DEFAULT 0, enabled TINYINT(1) NOT NULL DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     await tenantPool.query(
-      "INSERT INTO ai_credits (id, credits_total, credits_used, enabled) VALUES (1, ?, 0, 1)",
+      "INSERT INTO ai_credits (id, credits_total, credits_used, enabled) VALUES (1, ?, 0, 1) ON DUPLICATE KEY UPDATE credits_total = VALUES(credits_total)",
       [plans[input.plan].aiQuota],
     );
 
-    // 4. Master registry + login index, written last.
+    // 4. Master registry + login index, written last, in ONE transaction:
+    // if the login index insert fails, the tenants row rolls back too.
+    // A failed provision must never leave a tenant row that cannot log in.
     const branchSummary = JSON.stringify([{ id: branchId, name: input.branchName, city: input.branchCity || "" }]);
-    await masterPool.query(
-      "INSERT INTO tenants (id, name, database_name, plan, status) VALUES (?, ?, ?, ?, 'active')",
-      [tenantId, input.name, databaseName, input.plan],
-    );
-    await masterPool.query(
-      "INSERT INTO tenant_user_index (user_id, tenant_id, name, login, password_hash, role, branch_ids_json, permissions_json, active) VALUES (?, ?, ?, ?, ?, 'Owner', ?, ?, TRUE)",
-      [ownerUserId, tenantId, input.ownerName, input.ownerLogin, passwordHash, JSON.stringify([branchId]), JSON.stringify(ownerPermissions)],
-    );
-    await masterPool.query(
-      "UPDATE tenants SET branch_summary_json = ? WHERE id = ?",
-      [branchSummary, tenantId],
-    );
+    const masterConn = await masterPool.getConnection();
+    try {
+      await masterConn.beginTransaction();
+      await masterConn.query(
+        "INSERT INTO tenants (id, name, database_name, plan, status) VALUES (?, ?, ?, ?, 'active')",
+        [tenantId, input.name, databaseName, input.plan],
+      );
+      await masterConn.query(
+        "INSERT INTO tenant_user_index (user_id, tenant_id, name, login, password_hash, role, branch_ids_json, permissions_json, active) VALUES (?, ?, ?, ?, ?, 'Owner', ?, ?, TRUE)",
+        [ownerUserId, tenantId, input.ownerName, input.ownerLogin, passwordHash, JSON.stringify([branchId]), JSON.stringify(ownerPermissions)],
+      );
+      await masterConn.query(
+        "UPDATE tenants SET branch_summary_json = ? WHERE id = ?",
+        [branchSummary, tenantId],
+      );
+      await masterConn.commit();
+    } catch (error) {
+      await masterConn.rollback().catch(() => undefined);
+      throw error;
+    } finally {
+      await masterConn.release();
+    }
 
     return { tenantId, databaseName, ownerUserId, branchId };
   } finally {
