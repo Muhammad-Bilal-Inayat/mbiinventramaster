@@ -49,6 +49,18 @@ CORS rule (Phase 0): no origin is reflected in production. Set `CORS_ORIGIN` to 
 - MariaDB tenant provisioning: `db/migrations/003_mariadb_index.sql` creates the empty `tenant_user_index` table and `tenants.branch_summary_json` column that the MariaDB store queries. Inserting tenant/user rows into that index is Phase 1 provisioning work, not done in Phase 0.
 - MariaDB dashboard: in MariaDB mode the dashboard returns zeros until real reporting queries land in Phase 2/3. Demo dashboard numbers exist only in memory mode and must never be shown as production data.
 
+## Pre-push verify rule (standing, 2026-11-01)
+
+No push to main without: `npm run check` + `npm run build` green, every
+new/changed endpoint tested (success + auth fail + invalid input), a grep
+audit of `src/` + `public/` for TODO/stub/placeholder/demo/hardcoded, every
+visible button/nav/page either fully functional or clearly labelled
+"Coming soon / not built yet" (no fake success, fake trend, or fake number),
+no unused exports/functions/routes, and any remaining stub returning only
+501/503 with a clear "not saved" message — never a fake success. Claim only
+the scope that was actually tested. After push, verify via the GitHub API
+tree (commit SHA, parent, file count, key paths) and reset the local clone.
+
 ## Phase 1: tenant provisioning (MariaDB only)
 
 POST /api/master/tenants creates a tenant the safe way:

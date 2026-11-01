@@ -90,9 +90,3 @@ export const permissionLabels: Record<PermissionCode, string> = {
 };
 
 export const allPermissionCodes = Object.keys(permissionLabels) as PermissionCode[];
-
-export const moduleGroups = [
-  { key: "operations", label: "Operations", items: ["Dashboard", "POS & Sales", "Purchases", "Inventory", "Parties & Khata"] },
-  { key: "control", label: "Control room", items: ["Reports", "Branches", "Devices", "Users & permissions", "Sync health"] },
-  { key: "advanced", label: "Advanced suite", items: ["Accounting", "Prescriptions", "Controlled drugs", "Online store", "AI Copilot", "Attendance & payroll"] },
-];

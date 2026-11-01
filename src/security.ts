@@ -50,6 +50,3 @@ export function deviceFingerprint(input: string): string {
   return crypto.createHash("sha256").update(`${input}:${jwtSecret}`).digest("hex");
 }
 
-export function deviceSignature(deviceId: string, nonce: string, secret: string): string {
-  return crypto.createHmac("sha256", secret).update(`${deviceId}:${nonce}`).digest("hex");
-}
