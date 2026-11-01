@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import { hashPassword, randomId } from "./security.js";
 import { plans, type PlanId } from "./catalog.js";
 import { ensureMasterTables } from "./store.js";
+import { masterRegistry } from "./master.js";
 
 // Phase 1: tenant provisioning for MariaDB only.
 // All database credentials come from environment variables on the server
@@ -174,6 +175,12 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
     } finally {
       await masterConn.release();
     }
+
+    // License Manager: every new tenant gets one active, lifetime
+    // license matching its plan, with no expiry. Best-effort only: a
+    // license failure must never roll back a tenant that was just created
+    // (a tenant with no license record keeps working by design).
+    try { await masterRegistry.createLicense({ tenantId, plan: input.plan, lifetime: true }); } catch (error) { console.warn("License auto-create failed for new tenant (tenant keeps working):", error instanceof Error ? error.message : error); }
 
     return { tenantId, databaseName, ownerUserId, branchId };
   } finally {

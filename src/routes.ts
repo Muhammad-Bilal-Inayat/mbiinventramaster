@@ -3,6 +3,7 @@ import { z } from "zod";
 import { allPermissionCodes, plans } from "./catalog.js";
 import { signAccessToken, verifyAccessToken, verifyPassword, type AccessClaims, deviceFingerprint } from "./security.js";
 import { provisionTenant } from "./provision.js";
+import { masterRegistry, isLicenseBlocked } from "./master.js";
 import { chatWithGroq } from "./ai.js";
 import { DEFAULT_HOME_LAYOUT, type Store } from "./store.js";
 
@@ -47,6 +48,14 @@ function tenantGuard(store: Store) {
     // A token issued before a lock/maintenance/archived change must not
     // keep working. Only active tenants may use protected routes.
     if (tenant.status !== "active") return response.status(423).json({ error: "TENANT_UNAVAILABLE", message: "This tenant is not active." });
+    // License enforcement (Phase 5, License Manager): a tenant WITH a
+    // license is blocked while it is suspended, revoked or expired.
+    // Blocking never deletes or modifies data. A tenant with no license
+    // record keeps working, so existing tenants are never broken here.
+    try {
+      const license = await masterRegistry.getTenantLicense(tenant.id);
+      if (isLicenseBlocked(license ?? null)) return response.status(423).json({ error: "LICENSE_BLOCKED", message: "This tenant's license is suspended, revoked or expired. No data was deleted. Ask Master Admin to reactivate or extend the license." });
+    } catch { /* license lookup failure must not lock out a tenant */ }
     // A revoked device must not keep working on an old token either.
     // device_demo is the demo-session exception, already gated by ALLOW_DEMO_AUTH.
     if (request.auth.deviceId !== "device_demo") {
@@ -76,6 +85,10 @@ export function buildRouter(store: Store): Router {
     if (!user || !user.active || !(await verifyPassword(user.passwordHash, body.data.password))) return response.status(401).json({ error: "INVALID_CREDENTIALS", message: "Login details are not valid." });
     const tenant = await store.getTenant(user.tenantId);
     if (!tenant || tenant.status !== "active") return response.status(423).json({ error: "TENANT_UNAVAILABLE" });
+    try {
+      const license = await masterRegistry.getTenantLicense(tenant.id);
+      if (isLicenseBlocked(license ?? null)) return response.status(423).json({ error: "LICENSE_BLOCKED", message: "This tenant's license is suspended, revoked or expired. No data was deleted." });
+    } catch { /* license lookup failure must not lock out a tenant */ }
     // Phase 0 fix: login must not mint a new device on every sign-in and
     // bypass the device limit. Reuse the same HWID device when it exists,
     // otherwise enforce the tenant device limit (3 per tenant, see catalog).
@@ -116,6 +129,69 @@ export function buildRouter(store: Store): Router {
     try { return response.json({ tenants: await store.listTenants() }); } catch { return response.status(503).json({ error: "TENANT_DATABASE_NOT_FOUND" }); }
   });
 
+  // License Manager (Phase 5, /server only). Master-key gated. A tenant
+  // has at most one non-revoked license at a time; revoked licenses do
+  // not block a new one. Enforcement lives in tenantGuard/login above:
+  // suspended, revoked or expired (and not lifetime) blocks with 423
+  // and never deletes data. Tenants with no license record are unaffected.
+  function mapLicenseError(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "LICENSE_FAILED";
+    const map: Record<string, number> = { LICENSE_NOT_FOUND: 404, LICENSE_KEY_EXISTS: 409, LICENSE_ALREADY_ASSIGNED: 409, INVALID_TRANSITION: 409, INVALID_LICENSE_KEY: 400, INVALID_INPUT: 400, TENANT_NOT_FOUND: 404 };
+    return response.status(map[code] ?? 500).json({ error: code, message: code === "LICENSE_ALREADY_ASSIGNED" ? "This tenant already has a license. Revoke it first, or extend/suspend/reactivate the existing one." : code === "LICENSE_KEY_EXISTS" ? "This license key already exists." : code === "INVALID_TRANSITION" ? "This license cannot move to that state." : "License operation failed." });
+  }
+  router.get("/api/master/licenses", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const filters = { tenantId: typeof request.query.tenantId === "string" ? request.query.tenantId : undefined, status: typeof request.query.status === "string" ? request.query.status : undefined, plan: typeof request.query.plan === "string" ? request.query.plan : undefined, expiringSoon: request.query.expiringSoon === "true" };
+    try { return response.json({ licenses: await masterRegistry.listLicenses(filters) }); } catch { return response.status(503).json({ error: "LICENSE_FAILED" }); }
+  });
+  router.get("/api/master/licenses/:id", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const license = await masterRegistry.getLicense(String(request.params.id));
+    if (!license) return response.status(404).json({ error: "LICENSE_NOT_FOUND" });
+    return response.json({ license, history: await masterRegistry.listAudit(license.tenantId ?? undefined) });
+  });
+  router.post("/api/master/licenses", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ tenantId: z.string().min(1).max(96).nullable().optional(), plan: z.enum(["basic", "advanced"]), key: z.string().min(8).max(64).optional(), startDate: z.string().max(20).nullable().optional(), expiryDate: z.string().max(20).nullable().optional(), lifetime: z.boolean().optional(), maxDevices: z.number().int().min(1).max(100).nullable().optional(), notes: z.string().max(1000).nullable().optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (body.data.tenantId) {
+      const tenant = await store.getTenant(body.data.tenantId);
+      if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    }
+    try { return response.status(201).json({ license: await masterRegistry.createLicense(body.data) }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.post("/api/master/licenses/:id/suspend", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try { return response.json({ license: await masterRegistry.actLicense(String(request.params.id), "suspend") }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.post("/api/master/licenses/:id/reactivate", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try { return response.json({ license: await masterRegistry.actLicense(String(request.params.id), "reactivate") }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.post("/api/master/licenses/:id/revoke", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try { return response.json({ license: await masterRegistry.actLicense(String(request.params.id), "revoke") }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.post("/api/master/licenses/:id/extend", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ expiryDate: z.string().max(20).nullable().optional(), lifetime: z.boolean().optional(), notes: z.string().max(1000).nullable().optional(), plan: z.enum(["basic", "advanced"]).optional(), maxDevices: z.number().int().min(1).max(100).nullable().optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try { return response.json({ license: await masterRegistry.actLicense(String(request.params.id), "extend", body.data) }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.post("/api/master/licenses/:id/assign", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ tenantId: z.string().min(1).max(96) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const tenant = await store.getTenant(body.data.tenantId);
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    try { return response.json({ license: await masterRegistry.actLicense(String(request.params.id), "assign", body.data) }); } catch (error) { return mapLicenseError(error, response); }
+  });
+  router.get("/api/master/audit", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenantId = typeof request.query.tenantId === "string" ? request.query.tenantId : undefined;
+    return response.json({ audit: await masterRegistry.listAudit(tenantId) });
+  });
+
   // Phase 5 slice 1 — Public registration. Owner decision after pushback:
   // anyone may register a pharmacy, but the guardrails stay: plan is forced
   // to Basic (Advanced is a master-panel upgrade, so public signups cannot
@@ -153,6 +229,10 @@ export function buildRouter(store: Store): Router {
     try { tenant = await store.getPublicStore(tenantId); } catch { response.status(404).json({ error: "TENANT_NOT_FOUND" }); return null; }
     if (tenant.status !== "active") { response.status(423).json({ error: "TENANT_UNAVAILABLE" }); return null; }
     if (tenant.plan !== "advanced") { response.status(403).json({ error: "PLAN_NOT_ADVANCED", message: "Online store is available on the Advanced plan only." }); return null; }
+    try {
+      const license = await masterRegistry.getTenantLicense(tenant.id);
+      if (isLicenseBlocked(license ?? null)) { response.status(423).json({ error: "LICENSE_BLOCKED", message: "This pharmacy's license is suspended, revoked or expired." }); return null; }
+    } catch { /* license lookup failure must not lock out a store */ }
     if (!tenant.onlineStoreEnabled) { response.status(403).json({ error: "STORE_DISABLED", message: "This pharmacy's online store is turned off by the master panel." }); return null; }
     return tenant;
   }
