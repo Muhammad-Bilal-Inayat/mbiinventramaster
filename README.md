@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 4 slice 3: Prescriptions + Controlled drugs (local, not pushed yet)
+## Phase 4 slice 3: Prescriptions + Controlled drugs (pushed, commit 93c26f8)
 
 Advanced only, same rule as slices 1–2. New permissions
 prescriptions.create / prescriptions.dispense (owner + pharmacist;
