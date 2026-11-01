@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 4 slice 2: Accounting (local, not pushed yet)
+## Phase 4 slice 2: Accounting (pushed, commit 54fd7e1)
 
 Advanced only, same rule as slice 1. No separate stored ledger table:
 the summary and ledger are derived from Phase 3 sales, purchases and
