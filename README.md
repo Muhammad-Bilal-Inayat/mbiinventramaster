@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 4 slice 5: Online store + master per-tenant control (local, not pushed yet)
+## Phase 4 slice 5: Online store + master per-tenant control (pushed, commit 70fe55d)
 
 Phase 4 is closed by this slice: the last Phase 4 module, Online store
 (Advanced only, already listed in the Advanced plan modules). New
