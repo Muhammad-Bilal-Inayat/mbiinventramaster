@@ -1,0 +1,175 @@
+erDiagram
+  ORGANIZATIONS ||--o{ BRANCHES : owns
+  ORGANIZATIONS ||--o{ USERS : contains
+  ORGANIZATIONS ||--o{ MEDICINES : catalogs
+  BRANCHES ||--o{ USER_BRANCHES : scopes
+  USERS ||--o{ USER_BRANCHES : assigned
+  USERS ||--o{ USER_ROLES : has
+  ROLES ||--o{ USER_ROLES : grants
+  ROLES ||--o{ ROLE_PERMISSIONS : maps
+  PERMISSIONS ||--o{ ROLE_PERMISSIONS : includes
+  MEDICINES ||--o{ MEDICINE_BATCHES : has
+  BRANCHES ||--o{ BRANCH_STOCK : stores
+  MEDICINE_BATCHES ||--o{ BRANCH_STOCK : counted
+  BRANCHES ||--o{ STOCK_MOVEMENTS : records
+  MEDICINE_BATCHES ||--o{ STOCK_MOVEMENTS : changes
+  BRANCHES ||--o{ SALES : creates
+  USERS ||--o{ SALES : processes
+  SALES ||--o{ SALE_ITEMS : contains
+  MEDICINE_BATCHES ||--o{ SALE_ITEMS : sold
+  BRANCHES ||--o{ PURCHASES : receives
+  PURCHASES ||--o{ PURCHASE_ITEMS : contains
+  MEDICINE_BATCHES ||--o{ PURCHASE_ITEMS : received
+  BRANCHES ||--o{ STOCK_TRANSFERS : sends
+  BRANCHES ||--o{ STOCK_TRANSFERS : receives
+  STOCK_TRANSFERS ||--o{ TRANSFER_ITEMS : contains
+  MEDICINE_BATCHES ||--o{ TRANSFER_ITEMS : moved
+  USERS ||--o{ DEVICES : registers
+  BRANCHES ||--o{ DEVICES : authorizes
+  USERS ||--o{ AUDIT_LOGS : creates
+
+  ORGANIZATIONS {
+    bigint id PK
+  }
+  BRANCHES {
+    bigint id PK
+    bigint organization_id FK
+    varchar name
+    varchar code
+    boolean active
+  }
+  USERS {
+    bigint id PK
+    bigint organization_id FK
+    varchar name
+    varchar email
+    varchar password_hash
+    boolean mfa_enabled
+    boolean active
+  }
+  USER_BRANCHES {
+    bigint user_id FK
+    bigint branch_id FK
+    boolean is_primary
+  }
+  ROLES {
+    bigint id PK
+    varchar name
+  }
+  PERMISSIONS {
+    bigint id PK
+    varchar code
+    varchar module
+    varchar action
+  }
+  USER_ROLES {
+    bigint user_id FK
+    bigint role_id FK
+  }
+  ROLE_PERMISSIONS {
+    bigint role_id FK
+    bigint permission_id FK
+  }
+  MEDICINES {
+    bigint id PK
+    bigint organization_id FK
+    varchar sku
+    varchar barcode
+    varchar name
+    varchar strength
+    varchar form
+    boolean controlled
+  }
+  MEDICINE_BATCHES {
+    bigint id PK
+    bigint medicine_id FK
+    varchar batch_no
+    date expiry_date
+    decimal purchase_price
+    decimal sale_price
+  }
+  BRANCH_STOCK {
+    bigint id PK
+    bigint branch_id FK
+    bigint batch_id FK
+    int quantity
+    int reserved
+    int reorder_level
+    varchar bin_location
+  }
+  STOCK_MOVEMENTS {
+    bigint id PK
+    bigint branch_id FK
+    bigint batch_id FK
+    varchar type
+    int quantity
+    varchar reference_id
+    bigint created_by FK
+  }
+  SALES {
+    bigint id PK
+    bigint branch_id FK
+    bigint user_id FK
+    varchar invoice_no
+    decimal total
+    decimal discount
+    varchar status
+    datetime created_at
+  }
+  SALE_ITEMS {
+    bigint id PK
+    bigint sale_id FK
+    bigint batch_id FK
+    int quantity
+    decimal unit_price
+    decimal line_total
+  }
+  PURCHASES {
+    bigint id PK
+    bigint branch_id FK
+    varchar supplier_name
+    decimal total
+    varchar status
+    datetime created_at
+  }
+  PURCHASE_ITEMS {
+    bigint id PK
+    bigint purchase_id FK
+    bigint batch_id FK
+    int quantity
+    decimal unit_cost
+  }
+  STOCK_TRANSFERS {
+    bigint id PK
+    bigint from_branch_id FK
+    bigint to_branch_id FK
+    varchar status
+    bigint approved_by FK
+  }
+  TRANSFER_ITEMS {
+    bigint id PK
+    bigint transfer_id FK
+    bigint batch_id FK
+    int quantity
+  }
+  DEVICES {
+    bigint id PK
+    bigint user_id FK
+    bigint branch_id FK
+    varchar device_name
+    varchar hwid_hash
+    varchar public_key
+    varchar status
+    datetime last_seen
+  }
+  AUDIT_LOGS {
+    bigint id PK
+    bigint user_id FK
+    varchar action
+    varchar entity
+    varchar entity_id
+    text before_json
+    text after_json
+    varchar ip_address
+    datetime created_at
+  }

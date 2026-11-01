@@ -1,0 +1,27 @@
+sequenceDiagram
+  participant U as User Device
+  participant API as Node.js API
+  participant AUTH as Auth + HWID
+  participant ACL as Permission Engine
+  participant DB as MariaDB
+  participant S2 as Other Devices
+
+  U->>API: HTTPS login + device public key
+  API->>AUTH: Verify password, MFA, device signature
+  AUTH->>DB: Check user, device, status, expiry
+  DB-->>AUTH: Approved / blocked
+  AUTH-->>API: Short access token + refresh token
+  API->>ACL: Check function + branch permission
+  ACL->>DB: Read user roles and permissions
+  DB-->>ACL: allow / deny
+  ACL-->>API: Permission result
+  U->>API: Create sale / stock change with idempotency key
+  API->>DB: Transaction + row lock + audit log
+  DB-->>API: Commit with server version
+  API-->>U: Success + updated stock
+  API-->>S2: WebSocket event: stock version changed
+  S2->>API: Pull missing versions if offline
+  API->>DB: Read versioned movements
+  DB-->>API: Ordered events
+  API-->>S2: Apply events / resolve conflict
+  API->>DB: Save sync cursor and audit record

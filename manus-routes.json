@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"MBI Inventra Dashboard"},{"path":"/login","title":"Secure sign in"},{"path":"/inventory","title":"Inventory"},{"path":"/sales","title":"Sales & POS"},{"path":"/purchases","title":"Purchases"},{"path":"/reports","title":"Reports"},{"path":"/admin","title":"Admin control"}]}

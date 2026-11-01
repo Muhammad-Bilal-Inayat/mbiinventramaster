@@ -1,0 +1,52 @@
+flowchart TB
+  subgraph Public[Public SaaS Layer]
+    LAND[Landing / Pricing / Blog]
+    REG[Registration / Trial]
+    CHECK[Checkout / Licence]
+    DOMAIN[Custom Domain Resolver]
+  end
+  subgraph Control[Master Control Plane]
+    MASTER[Master Admin]
+    TENANT[Tenant Registry]
+    PLAN[Plans + Subscriptions]
+    DEVICE[Device Registry]
+    AUDIT[Security + Audit]
+  end
+  subgraph App[Shared Application Layer]
+    API[Node.js API]
+    AUTH[Auth + MFA]
+    ACL[Tenant + Branch + Function ACL]
+    SYNC[PWA Sync Engine]
+    JOBS[Background Jobs]
+  end
+  subgraph Data[MariaDB Data Isolation]
+    HUB[(master_control)]
+    T1[(tenant_000001)]
+    T2[(tenant_000002)]
+    TN[(tenant_N)]
+  end
+  LAND-->REG-->TENANT
+  LAND-->CHECK-->PLAN
+  DOMAIN-->API
+  MASTER-->TENANT
+  MASTER-->PLAN
+  MASTER-->DEVICE
+  MASTER-->AUDIT
+  TENANT-->HUB
+  PLAN-->HUB
+  DEVICE-->HUB
+  AUDIT-->HUB
+  API-->AUTH-->ACL
+  ACL-->T1
+  ACL-->T2
+  ACL-->TN
+  API-->SYNC
+  API-->JOBS
+  classDef public fill:#E9F2FF,stroke:#2563EB,color:#172554
+  classDef control fill:#F3E8FF,stroke:#7C3AED,color:#3B0764
+  classDef app fill:#E8F3F1,stroke:#0F766E,color:#083344
+  classDef db fill:#FFF7ED,stroke:#EA580C,color:#7C2D12
+  class LAND,REG,CHECK,DOMAIN public
+  class MASTER,TENANT,PLAN,DEVICE,AUDIT control
+  class API,AUTH,ACL,SYNC,JOBS app
+  class HUB,T1,T2,TN db

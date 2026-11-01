@@ -1,0 +1,71 @@
+flowchart TB
+  subgraph Devices[3 Registered Devices]
+    D1[Device 1\nAdmin / Owner]
+    D2[Device 2\nBranch Manager / POS]
+    D3[Device 3\nPharmacist / Inventory]
+  end
+  subgraph Server[Central Pharmacy Server]
+    NGINX[Nginx / HTTPS\nFirewall + Rate Limit]
+    API[Node.js API Server\nExpress / TypeScript]
+    AUTH[Auth + Session Service\nJWT + Refresh Token + MFA]
+    ACL[Permission Engine\nUser + Branch + Function]
+    HWID[Device Trust Service\nHWID + Signed Device Key]
+    SYNC[Sync Engine\nVersioning + Conflict Rules]
+    POS[Sales / POS Module]
+    INV[Inventory / Batch / FEFO]
+    PUR[Purchase / Supplier]
+    TRF[Branch Transfer]
+    REP[Reports / Dashboard]
+    AUD[Audit / Security Logs]
+    FILE[Local File Store\nInvoices / Prescriptions]
+  end
+  subgraph Data[MariaDB Database]
+    DB[(MariaDB Primary)]
+    LOG[(Audit + Login Logs)]
+    BACK[(Encrypted Backup\nLocal USB / Second Disk)]
+  end
+  subgraph Integrations[Optional Local Integrations]
+    BAR[USB Barcode Scanner]
+    PRN[Thermal Printer]
+    CSV[CSV Import / Export]
+  end
+  D1-->NGINX
+  D2-->NGINX
+  D3-->NGINX
+  NGINX-->API
+  API-->AUTH
+  API-->ACL
+  API-->HWID
+  API-->SYNC
+  API-->POS
+  API-->INV
+  API-->PUR
+  API-->TRF
+  API-->REP
+  API-->AUD
+  API-->FILE
+  AUTH-->DB
+  ACL-->DB
+  HWID-->DB
+  SYNC-->DB
+  POS-->DB
+  INV-->DB
+  PUR-->DB
+  TRF-->DB
+  REP-->DB
+  AUD-->LOG
+  DB-->BACK
+  D2-->BAR
+  D2-->PRN
+  D1-->CSV
+  SYNC-. WebSocket / REST .->D1
+  SYNC-. WebSocket / REST .->D2
+  SYNC-. WebSocket / REST .->D3
+  classDef device fill:#E8F3F1,stroke:#0F766E,color:#083344
+  classDef server fill:#E9F2FF,stroke:#2563EB,color:#172554
+  classDef data fill:#FFF7ED,stroke:#EA580C,color:#7C2D12
+  classDef ext fill:#F8FAFC,stroke:#64748B,color:#0F172A
+  class D1,D2,D3 device
+  class NGINX,API,AUTH,ACL,HWID,SYNC,POS,INV,PUR,TRF,REP,AUD,FILE server
+  class DB,LOG,BACK data
+  class BAR,PRN,CSV ext

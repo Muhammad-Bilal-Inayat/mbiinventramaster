@@ -1,0 +1,23 @@
+sequenceDiagram
+  participant A as Device 1\nOwner/Admin
+  participant B as Device 2\nManager/POS
+  participant C as Device 3\nPharmacist/Inventory
+  participant API as VPS Node.js API
+  participant DB as MariaDB Tenant DB
+  A->>API: Login + device signature + MFA
+  API->>DB: Verify user, plan, device, branch
+  DB-->>API: Approved session + permissions
+  API-->>A: Access token + sync cursor
+  B->>API: Login + device signature
+  C->>API: Login + device signature
+  B->>API: Sale request + idempotency key
+  API->>DB: Permission check + transaction + row lock
+  DB-->>API: Invoice committed + stock version
+  API-->>B: Sale success + receipt
+  API-->>A: Live event: sales and stock updated
+  API-->>C: Live event: stock updated
+  C->>API: Offline purchase queue after reconnect
+  API->>DB: Validate tenant, device, permissions, versions
+  DB-->>API: Commit or conflict result
+  API-->>C: Sync result + new cursor
+  API-->>A: Updated dashboard event

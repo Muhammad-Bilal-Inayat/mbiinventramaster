@@ -1,0 +1,22 @@
+flowchart LR
+  DEV[Developer / Local Code]-->GIT[Git Repository\nmain + develop branches]
+  GIT-->CI[CI Pipeline\nInstall + Lint + Typecheck]
+  CI-->TEST[Tests\nUnit + API + Tenant Isolation]
+  TEST-->BUILD[Build\nReact PWA + Node.js API]
+  BUILD-->IMAGE[Docker Images\nTagged Release]
+  IMAGE-->DEPLOY[Deploy Workflow\nSSH / Runner]
+  DEPLOY-->BACKUP[Pre-deploy\nMariaDB Dump + Restore Point]
+  BACKUP-->VPS[VPS\nDocker Compose]
+  VPS-->NGINX[Nginx\nDomain + HTTPS]
+  NGINX-->APP[Node.js API + PWA]
+  APP-->DB[(MariaDB\nMaster + Tenant DBs)]
+  APP-->REDIS[(Redis\nQueue + Rate Limit)]
+  APP-->FILES[(Encrypted Backups\nObject / Disk Storage)]
+  HEALTH[Health Checks\nAPI DB Disk Backup SSL]-->VPS
+  LOGS[Logs + Alerts]-->VPS
+  classDef code fill:#E9F2FF,stroke:#2563EB,color:#172554
+  classDef ops fill:#E8F3F1,stroke:#0F766E,color:#083344
+  classDef server fill:#FFF7ED,stroke:#EA580C,color:#7C2D12
+  class DEV,GIT,CI,TEST,BUILD,IMAGE code
+  class DEPLOY,BACKUP,HEALTH,LOGS ops
+  class VPS,NGINX,APP,DB,REDIS,FILES server

@@ -1,0 +1,336 @@
+# MBI Inventra — Features List
+
+> **Scope:** A clean features list, not an endpoint inventory. One line per feature, grouped by domain. Every group header carries the main code file(s) it comes from.
+> **Source:** Code read from repo `hostinghostinger1234-createnn/mbiinvdup`, branch `main`, **HEAD verified `d4eebd11`** (2026-11-01). No live testing, no guessing — anything not verified in code is marked **(unverified)**.
+> **Naming note:** The same three tiers appear under several names in code — Silver = Basic, Gold = Business, Platinum = Premium = Enterprise. They are the same tiers; the document uses Silver / Gold / Platinum.
+> **Prices (canonical):** Silver Rs 1,999/mo · Gold Rs 3,999/mo · Platinum Rs 6,999/mo; 1-year = monthly × 10 (2 free months, ~17% saving); 3-year = monthly × 30; 5-year = monthly × 50. Source: `src/config/canonicalPlans.ts`, `src/config/plansConfig.ts`, `src/lib/planLimitsService.ts`.
+
+---
+
+## 1. Server-side features
+
+### 1.1 Startup, hosting & build — `server.ts`, `server.js`, `app.js`, `package.json`, `scripts/`
+- Production entry is `app.js` → `server.js`, which auto-builds if `dist/` is missing or stale (built SHA ≠ source SHA) and then loads `dist/server.cjs` (built from `server.ts`).
+- Dev entry is `tsx watch server.ts`; build is `vite build` (client) + `esbuild server.ts` (server bundle) + a build-SHA stamp script.
+- Listens on `PORT` env or `3000` by default, with response compression and 100 MB JSON/body limits.
+- Central data directory resolver (`server/lib/dataDir.ts`) — all tenant data lives under `DATA_DIR` (pinned to `/home/<domain>/mbi_data` on the host), never inside a release folder; legacy release data is migrated, never overwritten.
+- Pre-deploy backup script (`scripts/predeploy-backup.cjs`) and a build-SHA stamp script (`scripts/stamp-build-sha.cjs`).
+
+### 1.2 Health & status — `server.ts`, `server/routes/versionRoutes.ts`
+- API health endpoint reporting server + database status.
+- Vault-engine health/status endpoint for the SQLite storage layer.
+- Data health endpoint showing the live data directory + tenant count.
+- Sync health/status endpoint.
+- Version endpoint reporting the running build version.
+
+### 1.3 Auth & sessions — `server/routes/authRoutes.ts`, `server/controllers/authController.ts`, `server/auth/jwt.ts`, `server/auth/password.ts`, `server/auth/totp.ts`
+- Username/email/mobile + password login issuing a JWT, with device tracking.
+- Google Sign-In (server-verified ID token) with automatic tenant provisioning.
+- 10-day free trial registration (trial tenant provisioning with phone validation).
+- Forgot-password via email OTP, and OTP verification + password reset.
+- Token refresh and a rescue path that re-issues a session when refresh fails.
+- Logout, and a separate master login for the Master panel.
+- Post-login phone gate for phoneless tenant owners (phone save + duplicate check).
+- Password policy enforced server-side (never trusted from the client alone).
+- TOTP two-factor auth for both master and tenant accounts (setup / enable / disable / status / reset).
+- Per-login audit events and login-attempt tracking.
+
+### 1.4 Devices & hardware binding — `server/routes/licenseRoutes.ts`, `server/routes/deviceAccessRoutes.ts`, `server/db/sqliteVaultManager.ts`
+- Licence-key validation that resolves the plan tier (Platinum/Enterprise → Platinum, Silver/Basic → Silver, anything else → Gold).
+- Device binding to a licence, bound-device listing, primary-device auto-bind, and hardware-ID (HWID) reset.
+- Licence countdown (trial/licence days-left and expiry) and licence status checks.
+- Device unlock-key generation + verification, device access requests, and request review/status flow.
+- Server-side device/user limit gates on every new bind and new user creation (see §3.1).
+
+### 1.5 Tenants, licences & plans — `server/routes/tenantRoutes.ts`, `server/routes/licenseRoutes.ts`, `server/routes/fleetRoutes.ts`, `server/lib/planLimits.ts`, `server/lib/licenseCountdown.ts`, `server/lib/renewalOptions.ts`
+- Tenant info, tenant data-key, tenant feature flags, and tenant UI settings (server-persisted).
+- Tenant sub-user controls and per-tenant 2FA management.
+- Licence creation, extension, plan change, and licence listing (master/fleet side).
+- Plan limits enforced server-side: Silver 2 devices / 2 users, Gold 5 / 5, Platinum 15 / 15, with grandfathering (a stored higher ceiling is honoured as a frozen cap, never raised by the gates).
+- Renewal options and licence countdown shared between server and client.
+- Tenant maintenance mode, tenant lock toggle, and tenant delete/wipe (master side, destructive — needs explicit master action).
+
+### 1.6 Sync & realtime — `server/routes/syncRoutes.ts`, `server/controllers/syncController.ts`, `server/lib/syncGuards.ts`, `server/lib/sseSanitizer.ts`
+- Sync pull (server → device) and push (device → server), plus single-record push and record delete.
+- Delta sync, batch sync, sync flush, sync diagnostics, sync logs, and connection-pool stats.
+- Server-Sent Events (SSE) live broadcast of tenant events, with sanitized payloads.
+- Sync restore points (create / read) and manual sync triggers (all tenants or one tenant).
+- Strict tenant isolation on pull: rows stamped with the JWT tenant; foreign-tenant rows are never served to the wrong tenant.
+- Sync push guards (server-side validation of pushed records) and quarantine of contaminated records.
+- Pull windows: invoices latest 500, purchases latest 200, party payments latest 500, shifts latest 50 (older records stay on the server but are not pulled to a fresh device).
+- Sync is permanently additive: it never deletes local records.
+
+### 1.7 Data storage, encryption & backups — `server/db/sqliteVaultManager.ts`, `server/db/tenantManager.ts`, `server/lib/tenantCrypto.ts`, `server/lib/legacyEncryptionKey.ts`, `server/lib/restorePoints.ts`, `server/services/tenantBackupService.ts`, `server/routes/backupRoutes.ts`
+- Per-tenant SQLite vaults (`tenants/<id>/vault.sqlite`) plus a master hub database holding all tenants.
+- Tenant data encrypted with AES-256-GCM using per-tenant derived keys; legacy encryption key kept decrypt-only for old data.
+- Data Guardian on server boot (vault protection/backup pass wired in `server.ts`).
+- Automatic restore points: on startup and before a new release is deployed (only restore points auto-expire; live data never auto-deletes).
+- Per-tenant encrypted backup service: full vault dump to encrypted JSON, with push / download / delete backup endpoints.
+- Tenant backup + restore endpoints, including backup listing and restore from backup.
+- Master client backups directory for operator-level tenant backups.
+
+### 1.8 Master panel / fleet / admin — `server/routes/adminMasterRoutes.ts`, `server/routes/adminRoutes.ts`, `server/routes/fleetRoutes.ts`, `server/routes/rbacRoutes.ts`, `server/routes/roleOverrideRoutes.ts`, `server/routes/auditRoutes.ts`, `server/routes/authAuditRoutes.ts`, `server/lib/systemLogger.ts`, `server/lib/tenantCounts.ts`
+- Master authentication: PIN verification, master 2FA (setup/enable/disable/status), email-OTP login, token revocation, and revoked-token listing.
+- Master security audit: auth events, IP block / unblock / whitelist, and security-audit log.
+- Fleet (client) management: tenant list, tenant save/create, tenant status, tenant delete, plan change, licence extend, licence key generate/revoke/verify, staff save, staff kill-switch, staff passcode reset, device transfer-slot, device revoke, and impersonation (master acts as a tenant).
+- Registration-lead approval flow (leads list / approve) and Google-user management (list / block / revoke / login history / convert to tenant).
+- Custom domains management (create / list / resolve / delete).
+- Central medicine catalogue: stats, metadata, CSV upload, single create, batch assignment, 14k seed, and per-tenant medicine revoke.
+- Role management: role list, per-user role assignment, and role-audit log.
+- Role overrides: master overrides and tenant-own overrides (see §3.1 for the Platinum rule), with a non-reversible hierarchy (master beats tenant).
+- Feature overrides per tenant (master can enable/disable features for one tenant).
+- Database doctor + diagnostics, database overview, per-table view/export, SQL dump, and schema download.
+- System logs + log stats (immutable operational logs; hourly auto-archive of entries older than 3 days; logs are never deleted).
+- Client error reports endpoint (frontend error logs stored per day, capped at 500).
+- LAN mode: LAN status, heartbeat, broadcast, and active-broadcast listing.
+- Print configuration, email settings + test mail, and email broadcast to tenants.
+- Broadcasts/notifications: create, history, receipts, resend, mark-seen, delete.
+- Support tickets: create, list, and status updates.
+- Depletion forecast and data-cleanup scan endpoints.
+- Homepage popup configuration (also exposed publicly).
+- Canonical tenant/licence counts (licence rows vs tenant rows are counted separately by design).
+
+### 1.9 AI services — `server/routes/aiRoutes.ts`, `server/services/aiAssistantService.ts`, `server/controllers/aiDataQueryEngine.ts`
+- AI ask endpoint (tenant-aware Q&A over the tenant's own data) and AI chat sessions (create/list/get/message/status/archive/unarchive/delete).
+- AI telemetry: click tracking and analytics.
+- AI settings, API-key management (add/remove/test-key), and per-tenant AI quotas with master override/reset (see §3.1 for plan quotas).
+- AI lead capture (leads list / update) and AI data-query engine for structured questions over tenant data.
+- Model chain: primary model with backup-model rotation and a local fallback so a reply is always returned (never a hang).
+- Immutable AI audit logs endpoint (kept for compatibility; chat history itself lives in the local session store).
+
+### 1.10 Messaging: email & WhatsApp — `server/services/emailService.ts`, `server/routes/whatsappRoutes.ts`, `server/services/whatsappMetaService.ts`
+- SMTP email service with per-tenant settings, test mail, and admin alert emails (e.g. new-registration alerts).
+- WhatsApp settings per tenant, pairing (QR start / QR fetch / status / disconnect), send, and per-tenant send history.
+- WhatsApp agent configuration endpoints.
+- WhatsApp Meta Cloud API service: per-tenant config (API key, phone number ID), Meta send, Meta history, Meta config verify, and per-recipient delivery tracking (sent/delivered/failed). Header labels this a Platinum plan feature (route-level plan enforcement **(unverified)** — see §3.4).
+- Master gateway toggle for WhatsApp (admin side).
+
+### 1.11 Website, blog & CMS — `server/routes/blogRoutes.ts`, `server/routes/blogCmsRoutes.ts`, `server/routes/cmsRoutes.ts`, `server/routes/leadCaptureRoutes.ts`, `server/routes/checkoutRoutes.ts`
+- Public blog posts (list / by slug) and master blog management (create / update / delete / duplicate / stats).
+- Site CMS configuration and testimonials management (create / update / delete).
+- Public lead capture (submit / list) for trial/demo requests.
+- Checkout orders (create / list / verify / reject / delete) for plan purchases.
+
+### 1.12 Attendance & payroll — `server/routes/attendanceRoutes.ts`
+- Staff list (including custom staff), shop-location settings, and daily check-in / check-out / manual mark.
+- Monthly attendance view, holidays management, and payroll view + save.
+- Staff advances (list / add) and an attendance dashboard.
+- Daily attendance report email to each tenant owner at their configured time (server scheduler checks every 15 minutes).
+- Report send endpoint for on-demand attendance reports.
+
+### 1.13 Purchases (server API) — `server/routes/purchaseRoutes.ts`, `server/controllers/purchaseController.ts`
+- Purchase bill read (list / single), purchase bill create, and purchase inward (goods-receipt) posting.
+
+### 1.14 Dashboard (server API) — `server/routes/dashboardRoutes.ts`
+- Server-side dashboard summary endpoint aggregating tenant totals.
+
+### 1.15 Security middleware — `server/middleware/rateLimiter.ts`, `server/middleware/tenantMiddleware.ts`, `server/middleware/masterAuthMiddleware.ts`, `server/middleware/licenseExpiry.ts`
+- Rate limiters: login, OTP, master login, registration velocity, forgot-password velocity, and a public-form honeypot.
+- Auth middleware: tenant JWT required for tenant routes, master auth required for master routes.
+- Licence-expiry middleware and tenant-isolation middleware (server tenant always comes from the JWT, never from client input).
+- Auto-lock/backoff on repeated wrong passwords, and emergency lock + emergency recovery flows (master side).
+
+### 1.16 Server scheduled jobs & background tasks — `server.ts`
+- System-log auto-archive every hour (entries older than 3 days move to Archived; never deleted).
+- Attendance daily-report scheduler (checks every 15 minutes; sends at each tenant's configured time).
+- SSE keep-alive timer and debounced sync-flush timers for realtime delivery.
+- Boot-time data-guardian pass and automatic restore-point creation on startup and on new-release deploy.
+
+---
+
+## 2. User-side features (the app the shopkeeper uses)
+
+### 2.1 Auth pages — `src/pages/LoginPage.tsx`, `src/pages/RegisterPage.tsx`, `src/components/auth/LoginModal.tsx`, `src/components/auth/RegisterModal.tsx`, `src/pages/AuthPage.tsx`
+- Sign-in modal and full login page (username / email / mobile + password, remember-me, hardware guard, forgot-password flow).
+- Registration modal and full register page (pharmacy name, owner, username, WhatsApp/mobile, city, email, password + confirm, terms acceptance, 10-day free-trial activation).
+- Google Sign-In button and post-login phone gate modal for phoneless owners.
+- Login ↔ register switching and a third legacy auth surface (`AuthPage.tsx`).
+
+### 2.2 Home, landing & public pages — `src/pages/Home.tsx`, `src/pages/LandingPage.tsx`, `src/pages/CheckoutPage.tsx`, `src/pages/BlogListingPage.tsx`, `src/pages/BlogDetailPage.tsx`, `src/components/landing/`
+- Public home/landing pages with feature cards, testimonials, pricing section, and plans modal.
+- Plans + checkout flow (plan select → order → payment verification).
+- Blog listing + blog detail pages (CMS-driven) and SEO pages (sitemap, privacy, terms).
+- Landing AI widget: local keyword engine answering plans/pricing/features/trial/demo questions, with a medicine-question boundary (no medical advice) and hotline/WhatsApp fallback.
+
+### 2.3 Dashboard — `src/pages/Dashboard.tsx`, `src/components/dashboard/`, `src/lib/dashboardSummaryService.ts`, `src/lib/cashInHand.ts`
+- Dashboard with sales/purchase/khata summaries, low-stock alerts, and top products.
+- Cash in Hand = cumulative all-time drawer cash (cash in − cash out), not today-only.
+- Daily notes, activity logs, and shortcut keys (Ctrl+K search, Alt+S sale, Alt+B purchase).
+
+### 2.4 Sale / POS billing — `src/pages/SaleInvoicePage.tsx`, `src/pages/Billing.tsx`, `src/components/pos/`, `src/components/sales/`, `src/lib/invoiceNumbering.ts`, `src/lib/ledgerService.ts`
+- Ultra-fast POS billing (0.2s target) with barcode scanning, batch selection, and thermal receipt printing (58/80 mm).
+- Sale invoices, sale returns, credit notes, and sale drafts with offline auto-save.
+- Tab-claim invoice numbering (each open tab takes the next free number; closing an unsaved tab releases it; save-time dedupe prevents duplicate numbers).
+- Multi-batch picker with auto FIFO (oldest batch first) for multi-batch products.
+- Sale orders, sale quotations, sale estimates, and delivery challans (Gold and above — see §3.2).
+- Discount handling with a non-owner discount cap, and customer price/margin rules.
+- Invoice print preview, print templates, and column configuration (tenant-level, server-persisted).
+- Convert a sale into a warranty bill and back (see §4).
+
+### 2.5 Purchase — `src/pages/PurchaseInvoicePage.tsx`, `src/pages/Purchases.tsx`, `src/components/purchases/`
+- Purchase bills, purchase returns, purchase orders (all plans), goods inward (receipt posting), and payment-out against purchases.
+- Supplier selection with walk-in supplier support (walk-in purchases appear in Supplier Khata).
+- Batch + expiry entry on bills, FEFO-aware stock intake, and purchase draft restore.
+- Purchase invoice numbering with the same tab-claim protocol as sales.
+- Convert a purchase into a warranty bill and back (see §4).
+
+### 2.6 Inventory & items — `src/pages/Inventory.tsx`, `src/components/inventory/`, `src/lib/fefoEngine.ts`, `src/lib/centralMedicineDatabaseService.ts`
+- Item catalogue with a 100k+ preloaded medicine database, generic salt formulas, and brand alternatives.
+- Batch management with FEFO expiry radar: 30/60/90-day alerts on all plans, 180-day extended radar on Gold and above.
+- Stock summary, stock detail, item detail, low-stock alerts, and shortage registry.
+- Batch traceability (batch → bill trace) and item serial/batch reports.
+- CSV/Excel import/export of items and stock.
+- Multi-godown (warehouse) management and inter-godown stock transfers (Platinum only — see §3.2).
+- Duplicate-medicine guard and oversell warning on billing.
+
+### 2.7 Parties & khata — `src/pages/AllPartiesPage.tsx`, `src/pages/PartiesManagementPage.tsx`, `src/pages/CustomerKhataPage.tsx`, `src/pages/SupplierKhataPage.tsx`, `src/components/parties/`, `src/components/khata/`, `src/lib/ledgerService.ts`
+- Parties list with receivable / payable / net summary cards and per-party balances.
+- Customer khata and supplier khata with one row per transaction (cash rows labelled Cash, credit rows labelled Credit, no automatic counter-entries).
+- Party detail modal with ledger statement, purchase/sale/manual-payment rows, running balance, profile edit, and print statement.
+- Record Payment flow (manual payments) and party statement print.
+- Walk-in customer and walk-in supplier rows (synthetic rows, matched by exact name for payments).
+- Party groups, party search/sort/filter, and soft-delete of parties (deleted parties stay deleted across sync).
+
+### 2.8 Money: bank, expenses & shifts — `src/pages/Bank.tsx`, `src/pages/Expenses.tsx`, `src/pages/ShiftManagement.tsx`, `src/pages/CashInHand.tsx`, `src/components/bank/`, `src/components/expenses/`
+- Bank accounts, bank transactions, bank statements, cheques, and loan accounts.
+- Expense recording with expense categories and expense-item reports.
+- Cashier shifts (open/close, shift summary) and cash-in-hand tracking.
+- Payment handling on bills (cash/credit, partial payments, balance-due tracking).
+
+### 2.9 Bookers & field force — `src/pages/BookersManagement.tsx`, `src/components/bookers/`, `src/lib/bookerService.ts` (Gold and above)
+- Booker/biller management, booker ledger, and booker commission tracking + commission reports.
+
+### 2.10 Prescriptions & clinical — `src/pages/PrescriptionManagement.tsx` (Gold and above; narcotics/controlled registers are Platinum — see §3.2)
+- Prescription recording and management, patient chronic-medication refills, and controlled-drug handling with approval flows and print controls.
+
+### 2.11 Reports — `src/pages/Reports.tsx`, `src/pages/navigationMeta.ts`, `src/components/reports/`
+- Transaction reports: balance sheet, profit & loss, bill-wise profit, discount report, tax reports, Form 27EQ, TCS receivable.
+- Party reports: party statement, party-wise P&L, all parties, party report by item, sale/purchase by party and by party group, sale summary by HSN.
+- Item/stock reports: stock summary/detail, item detail, FIFO allocation, FEFO expiry, item batch, item serial, item-wise P&L, low-stock summary, category profitability heatmap, sale/purchase by item category, item-wise discount.
+- Business-status reports: bank statement, discount report; expense reports (expense, expense category, expense item); order reports (sale/purchase orders, order items); loan statements.
+- Regulatory reports: Controlled Items Register (Form-7) and Warranty Register (see §4).
+- Excel export and print for every report, with date-range and firm/user filters.
+
+### 2.12 Online store & web orders — `src/pages/OnlineStoreManagement.tsx`, `src/components/store/` (Platinum only — see §3.2)
+- Online customer storefront, digital product catalogue, store promotions, and web-orders management.
+
+### 2.13 Journals & accounting — `src/pages/JournalVouchers.tsx`, `src/pages/LedgersStatementsPage.tsx`, `src/pages/Accounts/Ledgers` (Platinum only — see §3.2)
+- Journal vouchers, double-entry accounting, chart of accounts, trial balance, and consolidated financial audits.
+
+### 2.14 Settings — `src/pages/Settings.tsx`, `src/components/settings/`, `src/contexts/SettingsContext.tsx`
+- Settings tabs: general, transaction, print, item, feature flags, and more — tenant/user settings never change on redeploy, logout, refresh, device change, migration, or sync.
+- Invoice settings panel, print templates, page-setup dialog, column configuration, and warranty field defaults (see §4).
+- Feature-flag management and per-tenant feature toggles (master-controlled).
+
+### 2.15 Sync, backup & sharing — `src/pages/SyncAndShare.tsx`, `src/pages/SyncHealthPage.tsx`, `src/lib/syncEngine.ts`, `src/lib/syncManager.ts`, `src/lib/syncService.ts`, `src/lib/backupManager.ts`, `src/lib/db.ts`, `src/components/sync/`, `src/components/pwa/`
+- Bottom-strip Sync button (push-only: uploads local records to the server) and per-page "Fetch latest" (pull-only: downloads server records).
+- Automatic sync on app boot, on focus, on a 30-second poll, and over live SSE events.
+- Offline-first engine: full billing/inventory/khata working without internet, with offline auto-save and auto-recovery.
+- Sync health page, sync diagnostics, and per-collection sync state.
+- Local backup manager (device backup with rotation) and PWA install support.
+- Locked tenant anchor: one canonical tenant ID per session, checksum-protected, re-locked only on explicit re-login — this is what keeps tenant data from mixing.
+- Synced record types: medicines, invoices, purchase orders, parties/suppliers, party payments, expenses, bank transactions, audit logs, users, user activities, bank accounts, cheques, loan accounts, cashier shifts, online orders, online promotions, store settings, shortage items, narcotics logs, chronic refills, supplier returns, loyalty customers, notes, bookers, booker transactions.
+
+### 2.16 AI inside the app — `src/pages/AiAssistantPage.tsx`, `src/pages/AiGuidePage.tsx`, `src/components/ai/`, `src/lib/assistantKnowledgeService.ts`, `src/lib/assistantTenantDataService.ts`
+- AI Copilot drawer (owner-only, bottom-left) answering questions over the tenant's own data, with local fallback replies (never a stuck spinner).
+- AI Guide page with live chat sessions and data-aware answers.
+- AI speaks shopkeeper language only (no technical words like tenant/JWT/API/database in replies).
+- Daily AI quotas by plan (see §3.1).
+
+### 2.17 Master panel (client) — `src/pages/MasterCommandCenter.tsx`, `src/pages/MasterServerHub.tsx`, `src/pages/master/`, `src/components/server/`, `src/components/admin/`
+- Master command center: fleet overview, tenant management, licence management, and device management.
+- Master server hub: server health, backups, restore points, audit logs, error logs, and system logs.
+- Master printer-templates panel (including drug-warranty invoice defaults — see §4).
+- Software sales revenue dashboard, feature-management panel, and impersonation support.
+
+### 2.18 Support & misc — `src/pages/HelpDeskPage.tsx`, `src/pages/Feedback.tsx`, `src/pages/Utilities.tsx`, `src/pages/SoftwareUpdatesPage.tsx`, `src/pages/TopProducts.tsx`, `src/pages/DailyNotes.tsx`, `src/pages/ActivityLogsPage.tsx`, `src/pages/LowStockAlerts.tsx`, `src/pages/ShortageRegistry.tsx`, `src/pages/GodownManagement.tsx`
+- Help desk, feedback submission, utilities, software-updates page, and setup-business onboarding.
+- Top products, daily notes, activity logs, low-stock alerts, shortage registry, and godown management pages.
+- Keyboard navigation, barcode audio feedback, and clock-integrity checks.
+
+---
+
+## 3. Enterprise (Platinum) plan features — marked enterprise-only
+
+> **Prices & limits:** Platinum = Rs 6,999/mo (1-year Rs 69,990; 3-year Rs 209,970; 5-year Rs 349,950) · 15 user accounts · 15 devices/terminals · 10 branches. Sources: `src/config/canonicalPlans.ts`, `server/lib/planLimits.ts`. Gold = 5 users / 5 devices / 5 branches; Silver = 2 / 2 / 2.
+
+### 3.1 Server side — what the server enables/allows for Platinum tenants
+- [ENTERPRISE] Device limit 15 and user-account limit 15 enforced on every new device bind and new user creation (`server/lib/planLimits.ts`, `server/routes/deviceAccessRoutes.ts`, `server/controllers/userController.ts`, `server/db/sqliteVaultManager.ts`).
+- [ENTERPRISE] Grandfathering: a stored ceiling above the plan limit is honoured as a frozen cap and never raised by the gates; existing devices/users are never removed, unbound, or locked by plan enforcement.
+- [ENTERPRISE] Fleet plan update maps enterprise → 15 for both max_devices and max_users (`server/routes/fleetRoutes.ts`).
+- [ENTERPRISE] Role-override write for the tenant's own sub-users: Platinum tenant owners may set overrides for their own sub-users only; a master override, once set, can never be overwritten or removed by the tenant (`server/services/roleOverrideService.ts`, `server/routes/roleOverrideRoutes.ts` — non-Platinum write attempts get "Role customization is a Platinum feature").
+- [ENTERPRISE] AI quota 300 questions/day (vs Gold 100, Silver 50, trial/guest 20), with optional master quota override (`server/services/aiAssistantService.ts`).
+- [ENTERPRISE] WhatsApp Meta Cloud API service is labelled a Platinum plan feature (`server/services/whatsappMetaService.ts`); route-level plan enforcement on the WhatsApp routes was **(unverified)** — see §3.4.
+- [ENTERPRISE] Licence-key validation maps PLAT/ENTERPRISE plan strings to the Platinum tier (`server/routes/licenseRoutes.ts`).
+
+### 3.2 User side — what Platinum users get in the app
+- [ENTERPRISE] Multi-godown / multi-warehouse management and inter-godown stock transfers (`src/utils/planPermissions.ts` module tiers: `godowns`, `multi_godowns`, `multi_warehouse`, `stock_transfer`, `godown_management`).
+- [ENTERPRISE] FBR POS integration + digital fiscalization: tax-FBR, FBR POS, digital fiscal stamps, QR digital tax stamps, sales-tax invoicing, FBR tax audit reports.
+- [ENTERPRISE] Double-entry accounting: chart of accounts, journal vouchers, trial balance, and consolidated financial audits.
+- [ENTERPRISE] Online customer storefront + e-commerce: online storefront, web-orders manager, online promotions, digital product catalogue, online store sales/performance reports.
+- [ENTERPRISE] Multi-branch HQ: multi-branch operations, inter-branch stock transfers + transfer approvals, centralized branch sync, consolidated chain analytics, multi-branch consolidated reports.
+- [ENTERPRISE] Regulatory registers: narcotics register, controlled-drug register, and DRAP Form 8 register.
+- [ENTERPRISE] Custom field-level permissions and custom field security.
+- [ENTERPRISE] Lifetime extended data recovery (extended recycle-bin / recovery window).
+- [ENTERPRISE] All 24 dashboard widgets (lower plans see a subset).
+- [ENTERPRISE] Mesh sync (multi-branch mesh synchronization) and AI reorder velocity.
+- [ENTERPRISE] Automated WhatsApp gateway (auto WhatsApp automation).
+- [ENTERPRISE] 10 branches and 15 user accounts / 15 terminals (vs Gold 5 / 5, Silver 2 / 2).
+- [ENTERPRISE] Full enterprise feature set in the plan dictionary (`src/lib/planFeatureManager.ts` PLAN_FEATURES.ENTERPRISE), which also includes the Gold-tier items by inheritance (bookers, prescriptions, audit trail — see note in §3.4).
+- NOT Platinum (for contrast, to avoid confusion): bookers/field force, prescriptions + chronic refills, full audit trail, sale orders/quotations/estimates/challans, and the 180-day FEFO radar are Gold-and-above, not Platinum-only; FEFO 30/60/90 alerts, purchase orders, and core POS/inventory/parties are Silver (all plans).
+
+### 3.3 Licence terms (Platinum)
+- Monthly, 1-year, 3-year, and 5-year durations; every multi-year price is exactly monthly × 10 per year (2 free months per year, ~17% saving).
+- Lifetime licences exist only in the master licence catalogue (no public equivalent): Silver Rs 120,000 · Gold Rs 250,000 · Platinum Rs 450,000 (values from the old master catalogue, carried into `src/config/canonicalPlans.ts` as `lifetime`).
+- Short trial durations (2/7/15 days) exist only in the master licence catalogue; the public trial is the 10-day free trial.
+- Licence expiry is enforced by the licence-countdown + licence-expiry middleware; expired licences fall back to restricted behaviour (exact restriction set **(unverified)** in the lines read).
+
+### 3.4 Server/user gating mismatches — flagged plainly, not smoothed over
+- **Most Platinum features are enforced client-side only.** The sidebar, module tiers (`src/utils/planPermissions.ts`), and route gates hide Platinum menus from Silver/Gold users, but the server does not re-check feature use on sync: sync accepts record types regardless of plan. Server-side enforcement is limited to device/user limits, role-override writes, AI quotas, and licence validation. A modified client could therefore sync Platinum-feature data that the server would store.
+- **Unknown-plan defaults differ by endpoint.** Licence-key validation maps an unrecognised plan to Gold (`server/routes/licenseRoutes.ts`), while the plan-limits resolver returns null for unrecognised plans and its callers fall back to Basic limits (`server/lib/planLimits.ts` — fail-closed-Basic). Same tenant, different assumed tier depending on which endpoint runs.
+- **Display fallbacks disagree with enforcement.** Fleet list fallbacks (`max_users || 5`, `max_devices || 3`), the tenant-column migration default (`max_devices DEFAULT 3`), and licence device-check fallbacks (`maxDevices = 10` when no licence record exists) all differ from the enforced 2/5/15 table. The plan-limits file itself documents these as display-only and never used by enforcement — but a reader of the fleet UI can still see the wrong numbers.
+- **Provisioning history.** Old trial provisioning seeded max_users = 10 and max_devices = 1 for Basic trials (vs advertised 2/2); new trials are seeded 2/2. Legacy tenants may still carry the old stored values, honoured only as frozen ceilings under the grandfathering rule.
+- **Branch vs device counts.** The catalogue's Platinum "10 branches" is a branch/firm count, not a device count (devices = 15). The plans config file explicitly warns not to confuse the two.
+- **Enterprise feature list includes Gold items by design.** `PLAN_FEATURES.ENTERPRISE` accumulates BASIC + BUSINESS + ENTERPRISE keys, so bookers, prescriptions, and audit-trail keys appear in the enterprise list too. That is inheritance, not a second gating rule — but it means the enterprise list alone cannot be read as "Platinum-only".
+- **WhatsApp gateway enforcement gap (unverified).** The auto-WhatsApp-gateway module key is Platinum in the client tiers and the Meta service header calls it a Platinum feature, but no plan check was found in `server/routes/whatsappRoutes.ts` itself. Whether the server blocks non-Platinum WhatsApp sends is not established from the code read.
+
+---
+
+## 4. Warranty logic (mandatory section)
+
+> **Plain summary first:** In MBI Inventra, "warranty" is a **pharma drug-warranty certificate (Form 2-A under the Drug Act 1976)** — a formality document that accompanies a sale or purchase bill. It is **not** a product warranty: there is **no warranty duration, no expiry date, no expiry calculation, no claims workflow, and no claim status** anywhere in the current code. The 2026-10-18 redesign explicitly removed type/period/claim-contact fields from the bill warranty config.
+
+### 4.1 Warranty features (one line each)
+- Warranty toggle on the sale bill form, turning the bill into a warranty bill (`src/pages/SaleInvoicePage.tsx`).
+- Warranty toggle on the purchase bill form, turning the bill into a warranty bill (`src/pages/PurchaseInvoicePage.tsx`).
+- Warranty bill is a **separate formality document**: converting a sale into a warranty bill loads it as a NEW document with no ID/number, leaving the original sale untouched; converting back strips the warranty flags and loads it as a normal sale.
+- Warranty fields on a bill: discount percentage (default 15%), NTN (TIN/NTN), and pharmacy licence number — licence + NTN are required when warranty is ON.
+- Three print toggles on a warranty bill: header on/off, print on/off, footer on/off.
+- Controlled-drug auto-off: warranty printing is automatically disabled when controlled-drug items are present on the bill.
+- Pre-warranty item backup: turning warranty OFF restores the exact pre-warranty item list.
+- Warranty Register report: all warranty bills (sale + purchase), tenant-isolated, with totals, total value, top party, and warranties-by-party, plus Excel export and print (`src/pages/Reports.tsx`, report id `warranty_register`, category "Warranty & Certificates").
+- Warranty print settings: show/hide discount %, show/hide TIN/NTN, show/hide licence on the printed bill (`src/types/invoice.ts`, `src/components/sales/InvoicePrintModal.tsx`, `src/components/sales/PrintPreviewModal.tsx`, `src/components/invoice/InvoiceSettingsPanel.tsx`).
+- Warranty columns on the printed bill: batch number and expiry columns are forced visible on warranty bills even when column config hides them.
+- Warranty terms line printed on invoices: "Warranty claims require invoice copy" (default invoice terms, `src/services/authService.ts`).
+- Warranty settings defaults: claim-contact display toggle + default claim contact (`support@mbiinventra.com / 0336-4585863`) in transaction settings (`src/contexts/SettingsContext.tsx`, `src/components/settings/TransactionTab.tsx`).
+- Server print defaults for the master printer-templates panel: header "TAX & DRUG WARRANTY INVOICE", Form 2-A declaration text ("Under Section 23 of Drug Act 1976… medicines sold do not contravene any section of Drug Act 1976"), and a show-drug-warranty flag (`server/routes/adminMasterRoutes.ts`).
+- Warranty plan gate: `warrantyManagement` permission key exists in the plan/permission files, and the purchase page applies an explicit plan gate (`isWarrantyAllowedForPlan`); the sale-page gate was **(unverified)** in the lines read.
+- Warranty Register navigation entry under "Warranty & Certificates" (`src/pages/navigationMeta.ts`).
+
+### 4.2 Warranty logic — short summary
+- **Where recorded:** On the bill record itself, not on items and not on a separate warranty table. Sale invoices and purchase orders carry `isWarrantyBill?: boolean` + `warrantyDetails?: { discountPct, tinNtn, licenseNumber, isHeaderEnabled, isFooterEnabled, isPrintingEnabled, hasControlledDrug, controlledPrintEnabled }` (sale bills additionally allow `customerSignature`, `sellerSignature`, `shopStamp`, `customFields`) — `src/types.ts`.
+- **Duration / expiry:** NONE. No duration field, no start/end date, no expiry calculation, and no expiry alert exists in current code. The redesign comment states it directly: "redesigned 2026-10-18: no type/period/claimContact" (`src/pages/SaleInvoicePage.tsx`). Any expiry shown on a warranty bill is the medicine batch expiry column, not a warranty expiry.
+- **Claims / returns:** NO claims workflow. There is no claim record, claim status, claim approval, or claim-to-return linkage. The only claim-related text is the printed terms line ("Warranty claims require invoice copy") and the settings display field for a claim contact. Sale/purchase returns are separate flows and are not linked to warranty bills.
+- **Sync:** NO dedicated warranty sync columns and NO warranty endpoint on the server. Warranty fields travel inside the bill record's JSON through the generic bill sync (invoices / purchases tables); nothing in `server/controllers/syncController.ts` or the client sync engine names a warranty column. (Verified by grep: zero `isWarrantyBill`/`warrantyDetails` matches in `server/` and in the client sync files.)
+- **UI surfaces that show warranty info:** sale bill warranty panel, purchase bill warranty panel, invoice print modal + print preview, Reports → Warranty Register, settings TransactionTab + PrintTab, master printer-templates panel.
+- **What is partial / absent (plainly):** duration/expiry — absent; claims tracking — absent; warranty-to-return linkage — absent; server-side warranty validation — absent (the server never checks warranty fields); sale-page plan gate — unverified. The warranty feature as built is a document + register + print feature, not a warranty-management system.
+
+---
+
+## Counts & verification notes
+
+- Server: 25 route files + `server.ts` inline routes (476 route registrations extracted from code, including multi-mount duplicates of the master router); 8 controllers; 5 services; 15 lib modules; 4 middleware files; 7 db modules.
+- Client: 66 page files, 117 lib files, 303 component files, 118 unique routes in `src/App.tsx`.
+- This section: server features §1, user features §2, enterprise features §3 (enterprise-only items marked), warranty §4 (mandatory, with absent parts stated plainly).
+- **Not verified from code read (do not treat as fact):** WhatsApp route-level plan enforcement; the exact expired-licence restriction set; the sale-page warranty plan gate; live runtime behaviour (this document is code-based only); the pre-2026-10-18 warranty design beyond what the redesign comment states.
+- **Deliberately excluded by the simplified scope:** endpoint-by-endpoint tables (replaced by this features list per the user's 2026-11-01 instruction).

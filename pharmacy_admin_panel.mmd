@@ -1,0 +1,38 @@
+flowchart LR
+  A[Admin Panel]-->B[Organization Settings]
+  A-->C[Branch Management]
+  A-->D[Users & Staff]
+  A-->E[Roles & Permissions]
+  A-->F[Devices & HWID]
+  A-->G[Security Center]
+  A-->H[Audit Logs]
+  A-->I[Backup & Restore]
+  A-->J[System Health]
+  E-->E1[Module Permission]
+  E-->E2[Action Permission]
+  E-->E3[Branch Scope]
+  E-->E4[Approval Limit]
+  E1-->P1[Inventory: view/create/edit/delete]
+  E1-->P2[Sales: view/create/refund/discount]
+  E1-->P3[Purchases: view/create/approve]
+  E1-->P4[Transfers: request/approve/dispatch/receive]
+  E1-->P5[Reports: view/export]
+  F-->F1[Register Device]
+  F-->F2[Approve / Revoke]
+  F-->F3[Bind User + Branch]
+  F-->F4[Last Seen + IP]
+  G-->G1[MFA Policy]
+  G-->G2[Session Timeout]
+  G-->G3[Failed Login Lock]
+  G-->G4[IP Allowlist]
+  G-->G5[Backup Encryption]
+  H-->H1[User Action]
+  H-->H2[Before / After Values]
+  H-->H3[Timestamp + IP]
+  H-->H4[Export Security Log]
+  classDef root fill:#102A43,color:#fff,stroke:#102A43
+  classDef section fill:#0F766E,color:#fff,stroke:#0F766E
+  classDef leaf fill:#E8F3F1,color:#083344,stroke:#0F766E
+  class A root
+  class B,C,D,E,F,G,H,I,J section
+  class E1,E2,E3,E4,F1,F2,F3,F4,G1,G2,G3,G4,G5,H1,H2,H3,H4,P1,P2,P3,P4,P5 leaf

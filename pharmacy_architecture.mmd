@@ -1,0 +1,96 @@
+flowchart TB
+  subgraph Users[Users & Access]
+    A[Owner / Super Admin]
+    B[Branch Manager]
+    C[Pharmacist]
+    D[Cashier]
+    E[Auditor]
+  end
+
+  subgraph Clients[Client Applications]
+    W[Web Admin Portal]
+    POS[Branch POS / Barcode Scanner]
+    M[Mobile Manager App]
+  end
+
+  subgraph Edge[Cloud Edge]
+    CDN[CDN + WAF]
+    API[API Gateway / Load Balancer]
+    AUTH[Auth Service\nJWT + MFA + RBAC]
+  end
+
+  subgraph Core[Core Application Services]
+    TEN[Tenant & Branch Service]
+    INV[Inventory & Batch Service]
+    SALE[Sales / POS Service]
+    PUR[Purchase & Supplier Service]
+    RX[Prescription Service]
+    REP[Reports & Analytics Service]
+    NOTI[Notification Service]
+    AUD[Audit & Compliance Service]
+  end
+
+  subgraph Data[Data & Infrastructure]
+    DB[(PostgreSQL\nPrimary Database)]
+    REDIS[(Redis\nCache + Locks)]
+    Q[Message Queue\nRabbitMQ / SQS]
+    OBJ[(Object Storage\nInvoices, Rx, Backups)]
+    BI[(Read Replica /\nAnalytics Warehouse)]
+  end
+
+  subgraph External[External Integrations]
+    PAY[Payment Gateway]
+    MSG[SMS / WhatsApp / Email]
+    TAX[Tax / E-Invoice API]
+    BAR[Barcode / Thermal Printer]
+  end
+
+  A-->W
+  B-->W
+  C-->POS
+  D-->POS
+  E-->W
+  W-->CDN
+  POS-->CDN
+  M-->CDN
+  CDN-->API
+  API-->AUTH
+  API-->TEN
+  API-->INV
+  API-->SALE
+  API-->PUR
+  API-->RX
+  API-->REP
+  API-->NOTI
+  API-->AUD
+  TEN-->DB
+  INV-->DB
+  SALE-->DB
+  PUR-->DB
+  RX-->OBJ
+  REP-->BI
+  DB-->BI
+  INV-->REDIS
+  SALE-->REDIS
+  SALE-->Q
+  INV-->Q
+  NOTI-->Q
+  AUD-->DB
+  SALE-->PAY
+  NOTI-->MSG
+  SALE-->TAX
+  POS-->BAR
+  Q-->OBJ
+
+  classDef user fill:#E8F3F1,stroke:#0F766E,color:#083344
+  classDef client fill:#E9F2FF,stroke:#2563EB,color:#172554
+  classDef edge fill:#F3E8FF,stroke:#7C3AED,color:#3B0764
+  classDef core fill:#ECFDF5,stroke:#059669,color:#064E3B
+  classDef data fill:#FFF7ED,stroke:#EA580C,color:#7C2D12
+  classDef ext fill:#F8FAFC,stroke:#64748B,color:#0F172A
+  class A,B,C,D,E user
+  class W,POS,M client
+  class CDN,API,AUTH edge
+  class TEN,INV,SALE,PUR,RX,REP,NOTI,AUD core
+  class DB,REDIS,Q,OBJ,BI data
+  class PAY,MSG,TAX,BAR ext

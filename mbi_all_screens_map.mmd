@@ -1,0 +1,39 @@
+flowchart TB
+  ROOT[MBI Inventra SaaS]
+  ROOT-->AUTH[Auth]
+  ROOT-->DASH[Dashboard]
+  ROOT-->POS[POS / Sales]
+  ROOT-->PUR[Purchases]
+  ROOT-->INV[Inventory]
+  ROOT-->PARTY[Parties / Khata]
+  ROOT-->MONEY[Bank / Expense / Shifts]
+  ROOT-->REP[Reports]
+  ROOT-->STAFF[Attendance / Payroll / Bookers]
+  ROOT-->RX[Prescriptions / Controlled Drugs]
+  ROOT-->STORE[Online Store / Orders]
+  ROOT-->ACCT[Accounting / Journals]
+  ROOT-->SYNC[Sync / Backup / PWA]
+  ROOT-->SET[Settings]
+  ROOT-->SUP[Help / Support / Utilities]
+  ROOT-->MASTER[Master Admin]
+  AUTH-->A1[Login, Register, Trial, OTP, MFA, Reset]
+  DASH-->D1[Sales, Profit, Cash, Alerts, Top Products]
+  POS-->P1[Invoice, Return, Credit, Draft, Barcode, Print]
+  PUR-->P2[Bill, Return, Order, Inward, Supplier Payment]
+  INV-->I1[Medicine, Batch, FEFO, Stock, Transfer, Import]
+  PARTY-->P3[Customer Khata, Supplier Khata, Payments, Statements]
+  MONEY-->M1[Bank, Cheque, Loan, Expense, Shift Close]
+  REP-->R1[Financial, Party, Item, Stock, Tax, Regulatory]
+  STAFF-->S1[Attendance, Payroll, Advances, Commission]
+  RX-->X1[Prescription, Refill, Narcotics, Registers]
+  STORE-->O1[Catalogue, Promotions, Web Orders, Store Reports]
+  ACCT-->C1[Chart, Journal, Trial Balance, Audit]
+  SYNC-->Y1[Offline Queue, Sync Health, Restore, Local Backup]
+  SET-->T1[General, Print, Invoice, Feature Flags, Security]
+  MASTER-->M2[Tenants, Plans, Licences, Devices, Logs, CMS]
+  classDef root fill:#102A43,color:#fff,stroke:#102A43
+  classDef module fill:#0F766E,color:#fff,stroke:#0F766E
+  classDef leaf fill:#E8F3F1,color:#083344,stroke:#0F766E
+  class ROOT root
+  class AUTH,DASH,POS,PUR,INV,PARTY,MONEY,REP,STAFF,RX,STORE,ACCT,SYNC,SET,SUP,MASTER module
+  class A1,D1,P1,P2,I1,P3,M1,R1,S1,X1,O1,C1,Y1,T1,M2 leaf
