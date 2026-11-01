@@ -132,6 +132,8 @@ export interface ControlledLogRecord {
   id: string; medicineId: string; batchId: string; branchId: string; quantity: number;
   prescriptionId: string | null; action: "sale" | "dispense"; createdBy: string; createdAt: string;
 }
+export interface AttendanceRecord { id: string; userId: string; branchId: string; date: string; checkIn: string | null; checkOut: string | null; hours: number; }
+export interface PayrollRow { userId: string; daysPresent: number; totalHours: number; monthlySalary: number; pay: number; }
 export interface AccountingSummary {
   revenue: number;
   purchases: number;
@@ -251,15 +253,20 @@ export interface Store {
   dispensePrescription(tenantId: string, userId: string, prescriptionId: string): Promise<PrescriptionRecord>;
   cancelPrescription(tenantId: string, userId: string, prescriptionId: string): Promise<PrescriptionRecord>;
   listControlledLogs(tenantId: string): Promise<ControlledLogRecord[]>;
+  checkIn(tenantId: string, userId: string, branchId: string): Promise<AttendanceRecord>;
+  checkOut(tenantId: string, userId: string): Promise<AttendanceRecord>;
+  listAttendance(tenantId: string, filters: { userId?: string; branchId?: string; date?: string }): Promise<AttendanceRecord[]>;
+  setStaffSalary(tenantId: string, userId: string, monthlySalary: number): Promise<{ userId: string; monthlySalary: number }>;
+  getPayroll(tenantId: string, month: string): Promise<PayrollRow[]>;
 }
 
 const ownerPermissions: PermissionCode[] = [
   "dashboard.view", "sales.view", "sales.create", "sales.refund", "sales.discount", "inventory.view", "inventory.edit", "inventory.adjust",
   "purchases.view", "purchases.create", "purchases.approve", "parties.view", "parties.payment", "reports.view", "reports.export",
-  "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "accounting.view", "admin.users", "admin.devices",
+  "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "payroll.view", "accounting.view", "admin.users", "admin.devices",
 ];
 const managerPermissions = ownerPermissions.filter((permission) => !["admin.users", "accounting.view"].includes(permission));
-const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view", "prescriptions.create", "prescriptions.dispense"];
+const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark"];
 
 class MemoryStore implements Store {
   private tenants = new Map<string, TenantRecord>();
@@ -374,6 +381,8 @@ class MemoryStore implements Store {
   private purchaseSeq = 0;
   private transfers = new Map<string, TransferRecord & { tenantId: string }>();
   private prescriptions = new Map<string, PrescriptionRecord & { tenantId: string }>();
+  private attendance = new Map<string, AttendanceRecord & { tenantId: string }>();
+  private staffSalaries = new Map<string, number>();
   private controlledLogs: Array<ControlledLogRecord & { tenantId: string }> = [];
   private partyToRecord(party: PartyRecord & { tenantId: string }): PartyRecord {
     const { tenantId: _t, ...rest } = party; return rest;
@@ -497,6 +506,51 @@ class MemoryStore implements Store {
   }
   async listControlledLogs(tenantId: string) {
     return this.controlledLogs.filter((log) => log.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((l) => { const { tenantId: _t, ...rest } = l; return rest; });
+  }
+  private attendanceToRecord(a: AttendanceRecord & { tenantId: string }): AttendanceRecord { const { tenantId: _t, ...rest } = a; return rest; }
+  async checkIn(tenantId: string, userId: string, branchId: string) {
+    const user = this.users.get(userId);
+    if (!user || user.tenantId !== tenantId || !user.active) throw new Error("USER_NOT_FOUND");
+    const date = new Date().toISOString().slice(0, 10);
+    const key = `${userId}:${date}`;
+    const existing = this.attendance.get(key);
+    if (existing && existing.tenantId === tenantId) throw new Error("ALREADY_CHECKED_IN");
+    const rec: AttendanceRecord & { tenantId: string } = { id: randomId("attendance"), tenantId, userId, branchId, date, checkIn: new Date().toISOString(), checkOut: null, hours: 0 };
+    this.attendance.set(key, rec);
+    return this.attendanceToRecord(rec);
+  }
+  async checkOut(tenantId: string, userId: string) {
+    const date = new Date().toISOString().slice(0, 10);
+    const rec = this.attendance.get(`${userId}:${date}`);
+    if (!rec || rec.tenantId !== tenantId) throw new Error("ATTENDANCE_NOT_FOUND");
+    if (rec.checkOut) throw new Error("ALREADY_CHECKED_OUT");
+    rec.checkOut = new Date().toISOString();
+    rec.hours = Math.round(((new Date(rec.checkOut).getTime() - new Date(rec.checkIn!).getTime()) / 3600000) * 100) / 100;
+    return this.attendanceToRecord(rec);
+  }
+  async listAttendance(tenantId: string, filters: { userId?: string; branchId?: string; date?: string }) {
+    return [...this.attendance.values()].filter((a) => a.tenantId === tenantId && (!filters.userId || a.userId === filters.userId) && (!filters.branchId || a.branchId === filters.branchId) && (!filters.date || a.date === filters.date)).sort((a, b) => b.date.localeCompare(a.date)).map((a) => this.attendanceToRecord(a));
+  }
+  async setStaffSalary(tenantId: string, userId: string, monthlySalary: number) {
+    const user = this.users.get(userId);
+    if (!user || user.tenantId !== tenantId) throw new Error("USER_NOT_FOUND");
+    if (!(monthlySalary >= 0)) throw new Error("INVALID_AMOUNT");
+    this.staffSalaries.set(userId, monthlySalary);
+    return { userId, monthlySalary };
+  }
+  async getPayroll(tenantId: string, month: string) {
+    if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("INVALID_INPUT");
+    const [y, m] = month.split("-").map(Number);
+    const daysInMonth = new Date(y, m, 0).getDate();
+    const byUser = new Map<string, { days: number; hours: number }>();
+    for (const a of this.attendance.values()) {
+      if (a.tenantId !== tenantId || !a.date.startsWith(month) || !a.checkIn) continue;
+      const e = byUser.get(a.userId) ?? { days: 0, hours: 0 }; e.days += 1; e.hours += a.hours; byUser.set(a.userId, e);
+    }
+    return [...byUser.entries()].map(([userId, e]) => {
+      const monthlySalary = this.staffSalaries.get(userId) ?? 0;
+      return { userId, daysPresent: e.days, totalHours: Math.round(e.hours * 100) / 100, monthlySalary, pay: Math.round(monthlySalary * e.days / daysInMonth * 100) / 100 };
+    }).sort((a, b) => a.userId.localeCompare(b.userId));
   }
   async listBatches(tenantId: string, medicineId: string) {
     return [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === medicineId).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate)).map((b) => this.batchToRecord(tenantId, b));
@@ -1091,6 +1145,69 @@ class MariaDbHealthStore implements Store {
     await this.ensurePhase4Slice3Tables(tenantPool);
     const rows = await tenantPool.query("SELECT id, medicine_id AS medicineId, batch_id AS batchId, branch_id AS branchId, quantity, prescription_id AS prescriptionId, action, created_by AS createdBy, created_at AS createdAt FROM controlled_logs ORDER BY created_at DESC LIMIT 200") as any[];
     return rows.map((r: any) => ({ id: r.id, medicineId: r.medicineId, batchId: r.batchId, branchId: r.branchId, quantity: Number(r.quantity), prescriptionId: r.prescriptionId, action: r.action, createdBy: r.createdBy, createdAt: String(r.createdAt) }));
+  }
+  private async ensurePhase4Slice4Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS attendance (id VARCHAR(96) PRIMARY KEY, user_id VARCHAR(96) NOT NULL, branch_id VARCHAR(96) NOT NULL, attendance_date DATE NOT NULL, check_in TIMESTAMP NULL, check_out TIMESTAMP NULL, hours DECIMAL(6,2) NOT NULL DEFAULT 0, UNIQUE KEY uq_attendance_user_date (user_id, attendance_date), INDEX idx_attendance_date (attendance_date)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS staff_profiles (user_id VARCHAR(96) PRIMARY KEY, monthly_salary DECIMAL(14,2) NOT NULL DEFAULT 0) ENGINE=InnoDB");
+  }
+  private async loadAttendance(tenantPool: any, id: string): Promise<AttendanceRecord | undefined> {
+    const rows = await tenantPool.query("SELECT id, user_id AS userId, branch_id AS branchId, attendance_date AS date, check_in AS checkIn, check_out AS checkOut, hours FROM attendance WHERE id = ? LIMIT 1", [id]) as any[];
+    const r = rows[0]; if (!r) return undefined;
+    return { id: r.id, userId: r.userId, branchId: r.branchId, date: String(r.date).slice(0, 10), checkIn: r.checkIn ? String(r.checkIn) : null, checkOut: r.checkOut ? String(r.checkOut) : null, hours: Number(r.hours) };
+  }
+  async checkIn(tenantId: string, userId: string, branchId: string) {
+    const user = await this.getUser(userId);
+    if (!user || user.tenantId !== tenantId || !user.active) throw new Error("USER_NOT_FOUND");
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice4Tables(tenantPool);
+    const id = randomId("attendance");
+    try {
+      await tenantPool.query("INSERT INTO attendance (id, user_id, branch_id, attendance_date, check_in) VALUES (?, ?, ?, CURDATE(), NOW())", [id, userId, branchId]);
+    } catch (e: any) {
+      if (String(e?.code) === "ER_DUP_ENTRY") throw new Error("ALREADY_CHECKED_IN");
+      throw e;
+    }
+    return (await this.loadAttendance(tenantPool, id))!;
+  }
+  async checkOut(tenantId: string, userId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice4Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id, check_in AS checkIn, check_out AS checkOut FROM attendance WHERE user_id = ? AND attendance_date = CURDATE() LIMIT 1", [userId]) as any[];
+    if (!rows.length) throw new Error("ATTENDANCE_NOT_FOUND");
+    if (rows[0].checkOut) throw new Error("ALREADY_CHECKED_OUT");
+    await tenantPool.query("UPDATE attendance SET check_out = NOW(), hours = ROUND(TIMESTAMPDIFF(MINUTE, check_in, NOW()) / 60, 2) WHERE id = ?", [rows[0].id]);
+    return (await this.loadAttendance(tenantPool, rows[0].id))!;
+  }
+  async listAttendance(tenantId: string, filters: { userId?: string; branchId?: string; date?: string }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice4Tables(tenantPool);
+    const where: string[] = []; const params: unknown[] = [];
+    if (filters.userId) { where.push("user_id = ?"); params.push(filters.userId); }
+    if (filters.branchId) { where.push("branch_id = ?"); params.push(filters.branchId); }
+    if (filters.date) { where.push("attendance_date = ?"); params.push(filters.date); }
+    const clause = where.length ? " WHERE " + where.join(" AND ") : "";
+    const rows = await tenantPool.query(`SELECT id FROM attendance${clause} ORDER BY attendance_date DESC LIMIT 200`, params) as any[];
+    const out: AttendanceRecord[] = [];
+    for (const r of rows) { const a = await this.loadAttendance(tenantPool, r.id); if (a) out.push(a); }
+    return out;
+  }
+  async setStaffSalary(tenantId: string, userId: string, monthlySalary: number) {
+    const user = await this.getUser(userId);
+    if (!user || user.tenantId !== tenantId) throw new Error("USER_NOT_FOUND");
+    if (!(monthlySalary >= 0)) throw new Error("INVALID_AMOUNT");
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice4Tables(tenantPool);
+    await tenantPool.query("INSERT INTO staff_profiles (user_id, monthly_salary) VALUES (?, ?) ON DUPLICATE KEY UPDATE monthly_salary = VALUES(monthly_salary)", [userId, monthlySalary]);
+    return { userId, monthlySalary };
+  }
+  async getPayroll(tenantId: string, month: string) {
+    if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("INVALID_INPUT");
+    const [y, m] = month.split("-").map(Number);
+    const daysInMonth = new Date(y, m, 0).getDate();
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice4Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT a.user_id AS userId, COUNT(*) AS daysPresent, COALESCE(SUM(a.hours), 0) AS totalHours, COALESCE(sp.monthly_salary, 0) AS monthlySalary FROM attendance a LEFT JOIN staff_profiles sp ON sp.user_id = a.user_id WHERE a.check_in IS NOT NULL AND DATE_FORMAT(a.attendance_date, '%Y-%m') = ? GROUP BY a.user_id ORDER BY a.user_id", [month]) as any[];
+    return rows.map((r: any) => ({ userId: r.userId, daysPresent: Number(r.daysPresent), totalHours: Number(r.totalHours), monthlySalary: Number(r.monthlySalary), pay: Math.round(Number(r.monthlySalary) * Number(r.daysPresent) / daysInMonth * 100) / 100 }));
   }
   async listBatches(tenantId: string, medicineId: string) {
     const tenantPool = await this.getTenantPool(tenantId);

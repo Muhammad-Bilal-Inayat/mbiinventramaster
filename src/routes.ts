@@ -420,6 +420,44 @@ export function buildRouter(store: Store): Router {
     try { return response.json({ transfer: await store.rejectTransfer(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase4Error(error, response); }
   });
 
+  // Phase 4 slice 4 — Staff attendance + simple pro-rata payroll, Advanced
+  // only. Payroll rule (documented, not a full payroll): pay = monthly
+  // salary x days present / days in month. No deductions, overtime or tax
+  // are calculated here.
+  function mapSlice4Error(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "SLICE4_ERROR";
+    const map: Record<string, number> = { USER_NOT_FOUND: 404, ATTENDANCE_NOT_FOUND: 404, INVALID_AMOUNT: 400, INVALID_INPUT: 400, ALREADY_CHECKED_IN: 409, ALREADY_CHECKED_OUT: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    return response.status(map[code] ?? 500).json({ error: code, message: code === "ALREADY_CHECKED_IN" ? "Already checked in today." : code === "ALREADY_CHECKED_OUT" ? "Already checked out today." : "Attendance operation failed." });
+  }
+  router.post("/api/attendance/check-in", requirePermission("attendance.mark"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const body = z.object({ branchId: z.string().min(1) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.status(201).json({ attendance: await store.checkIn(request.auth!.tenantId, request.auth!.sub, body.data.branchId) }); } catch (error) { return mapSlice4Error(error, response); }
+  });
+  router.post("/api/attendance/check-out", requirePermission("attendance.mark"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    try { return response.json({ attendance: await store.checkOut(request.auth!.tenantId, request.auth!.sub) }); } catch (error) { return mapSlice4Error(error, response); }
+  });
+  router.get("/api/attendance", requirePermission("attendance.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const filters = { userId: typeof request.query.userId === "string" ? request.query.userId : undefined, branchId: typeof request.query.branchId === "string" ? request.query.branchId : undefined, date: typeof request.query.date === "string" ? request.query.date : undefined };
+    if (filters.branchId && !branchAccess(request, filters.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    return response.json({ attendance: await store.listAttendance(request.auth!.tenantId, filters) });
+  });
+  router.post("/api/staff/:id/salary", requirePermission("admin.users"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const body = z.object({ monthlySalary: z.number().min(0) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    try { return response.json(await store.setStaffSalary(request.auth!.tenantId, String(request.params.id), body.data.monthlySalary)); } catch (error) { return mapSlice4Error(error, response); }
+  });
+  router.get("/api/payroll", requirePermission("payroll.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const month = typeof request.query.month === "string" ? request.query.month : new Date().toISOString().slice(0, 7);
+    try { return response.json({ month, payroll: await store.getPayroll(request.auth!.tenantId, month) }); } catch (error) { return mapSlice4Error(error, response); }
+  });
+
   // Phase 4 slice 3 — Prescriptions + Controlled drugs, Advanced only.
   // A controlled medicine cannot be sold without a pending prescription for
   // the same branch covering the quantity; the sale (or a direct dispense)

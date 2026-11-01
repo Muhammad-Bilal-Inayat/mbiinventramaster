@@ -80,6 +80,27 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 4 slice 4: Staff attendance + payroll (local, not pushed yet)
+
+Advanced only, same rule as slices 1–3. New permissions
+attendance.view / attendance.mark (owner + pharmacist) and payroll.view
+(owner; manager inherits it via the owner set).
+- Attendance: check-in / check-out for today, one each per user per day
+  (double check-in 409, double check-out 409, check-out without check-in
+  404). Hours are computed from check-in to check-out.
+- Salary: POST /api/staff/:id/salary (admin.users only) stores the
+  monthly salary per user.
+- Payroll: GET /api/payroll?month=YYYY-MM — days present, total hours,
+  monthly salary, and pay by the documented simple rule:
+  pay = monthly salary x days present / days in month.
+- Honest limit: this is NOT a full payroll. No deductions, overtime,
+  allowances or tax are calculated here.
+- Frontend: new Attendance nav page (check-in/out, attendance list,
+  payroll by month, salary form for admins).
+- Migration db/migrations/008_tenant_attendance_payroll.sql
+  (tenant DBs only; tables also auto-created).
+- Remaining Phase 4 module NOT built yet: online store.
+
 ## Phase 4 slice 3: Prescriptions + Controlled drugs (pushed, commit 93c26f8)
 
 Advanced only, same rule as slices 1–2. New permissions
