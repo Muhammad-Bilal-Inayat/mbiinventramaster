@@ -61,6 +61,25 @@ no unused exports/functions/routes, and any remaining stub returning only
 the scope that was actually tested. After push, verify via the GitHub API
 tree (commit SHA, parent, file count, key paths) and reset the local clone.
 
+## AI + drag-drop home (Groq, per tenant)
+
+- AI chat: POST /api/ai/chat, JWT tenant only. The server calls Groq with
+  GROQ_API_KEY from the server env only. No key in Git, no key in a request,
+  no key in chat. If the key is missing: 503 AI_NOT_CONFIGURED, no credit
+  consumed, never a fake answer.
+- Credits: 1 chat request = 1 credit. Default credits = plan aiQuota
+  (Basic 20, Advanced 300). Master Admin sets a custom number per tenant
+  via POST /api/master/ai-credits (Master key) and reads it via
+  GET /api/master/ai-credits?tenantId=. Credits finished or disabled:
+  403, AI stays off, tenant data stays on.
+- AI icon: the chat button uses the MBI logo (public/assets/brand/MBI-LOGO.png).
+- Home drag-drop: GET/POST /api/home/layout. Each tenant drags its own
+  widgets (kpis, branch, alerts, top, activity, command) into its own order.
+  Layout is saved in that tenant's own database only, never shared.
+  The layout must contain each widget exactly once, or the API returns 400.
+- Tenant AI context is only that tenant's name, plan, branches and
+  dashboard counts. No other tenant's data is ever sent to the AI.
+
 ## Phase 1: tenant provisioning (MariaDB only)
 
 POST /api/master/tenants creates a tenant the safe way:

@@ -1,6 +1,17 @@
 import mariadb from "mariadb";
 import { hashPassword, randomId } from "./security.js";
-import type { PermissionCode, PlanId } from "./catalog.js";
+import { plans, type PermissionCode, type PlanId } from "./catalog.js";
+
+export const DEFAULT_HOME_LAYOUT = ["kpis", "branch", "alerts", "top", "activity", "command"] as const;
+export type HomeWidget = (typeof DEFAULT_HOME_LAYOUT)[number];
+
+export interface AiCredits {
+  total: number;
+  used: number;
+  remaining: number;
+  enabled: boolean;
+  custom: boolean;
+}
 
 export interface TenantRecord {
   id: string;
@@ -52,6 +63,11 @@ export interface Store {
   revokeDevice(tenantId: string, deviceId: string): Promise<boolean>;
   getDashboard(tenantId: string): Promise<DashboardRecord>;
   pingDatabase(): Promise<{ mode: "memory" | "mariadb"; ok: boolean }>;
+  getHomeLayout(tenantId: string): Promise<string[]>;
+  saveHomeLayout(tenantId: string, layout: string[]): Promise<string[]>;
+  getAiCredits(tenantId: string, plan: PlanId): Promise<AiCredits>;
+  setAiCredits(tenantId: string, input: { total: number; enabled: boolean }): Promise<AiCredits>;
+  consumeAiCredit(tenantId: string, plan: PlanId): Promise<{ ok: boolean; reason?: string; credits: AiCredits }>;
 }
 
 const ownerPermissions: PermissionCode[] = [
@@ -116,6 +132,30 @@ class MemoryStore implements Store {
   }
   async getDashboard(tenantId: string) { return this.dashboards.get(tenantId) ?? { revenue: 0, profit: 0, lowStock: 0, expiringSoon: 0, totalSkus: 0, branchPerformance: [], topProducts: [], activity: [] }; }
   async pingDatabase() { return { mode: "memory" as const, ok: true }; }
+  private homeLayouts = new Map<string, string[]>();
+  private aiCreditRows = new Map<string, { total: number; used: number; enabled: boolean; custom: boolean }>();
+  async getHomeLayout(tenantId: string) { return [...(this.homeLayouts.get(tenantId) ?? [...DEFAULT_HOME_LAYOUT])]; }
+  async saveHomeLayout(tenantId: string, layout: string[]) { this.homeLayouts.set(tenantId, [...layout]); return [...layout]; }
+  async getAiCredits(tenantId: string, plan: PlanId): Promise<AiCredits> {
+    const row = this.aiCreditRows.get(tenantId);
+    if (!row) return { total: plans[plan].aiQuota, used: 0, remaining: plans[plan].aiQuota, enabled: true, custom: false };
+    return { total: row.total, used: row.used, remaining: Math.max(0, row.total - row.used), enabled: row.enabled, custom: row.custom };
+  }
+  async setAiCredits(tenantId: string, input: { total: number; enabled: boolean }): Promise<AiCredits> {
+    const existing = this.aiCreditRows.get(tenantId);
+    const row = { total: input.total, used: existing?.used ?? 0, enabled: input.enabled, custom: true };
+    this.aiCreditRows.set(tenantId, row);
+    return { total: row.total, used: row.used, remaining: Math.max(0, row.total - row.used), enabled: row.enabled, custom: true };
+  }
+  async consumeAiCredit(tenantId: string, plan: PlanId) {
+    const credits = await this.getAiCredits(tenantId, plan);
+    if (!credits.enabled) return { ok: false, reason: "AI_DISABLED", credits };
+    if (credits.used >= credits.total) return { ok: false, reason: "AI_CREDITS_EXHAUSTED", credits };
+    const row = this.aiCreditRows.get(tenantId) ?? { total: credits.total, used: 0, enabled: true, custom: credits.custom };
+    row.used += 1; this.aiCreditRows.set(tenantId, row);
+    const next = { total: row.total, used: row.used, remaining: Math.max(0, row.total - row.used), enabled: row.enabled, custom: row.custom };
+    return { ok: true, credits: next };
+  }
 }
 
 class MariaDbHealthStore implements Store {
@@ -150,6 +190,66 @@ class MariaDbHealthStore implements Store {
   }
   async getDashboard() { return { revenue: 0, profit: 0, lowStock: 0, expiringSoon: 0, totalSkus: 0, branchPerformance: [], topProducts: [], activity: [] }; }
   async pingDatabase() { let connection; try { connection = await this.pool.getConnection(); await connection.query("SELECT 1"); return { mode: "mariadb" as const, ok: true }; } catch { return { mode: "mariadb" as const, ok: false }; } finally { connection?.release(); } }
+  private tenantPools = new Map<string, ReturnType<typeof mariadb.createPool>>();
+  private async getTenantPool(tenantId: string) {
+    const cached = this.tenantPools.get(tenantId);
+    if (cached) return cached;
+    const rows = await this.pool.query("SELECT database_name AS databaseName FROM tenants WHERE id = ? LIMIT 1", [tenantId]) as any[];
+    const databaseName = rows[0]?.databaseName;
+    if (!databaseName || !/^tenant_[0-9]{6}$/.test(databaseName)) throw new Error("TENANT_DATABASE_NOT_FOUND");
+    const tenantPool = mariadb.createPool({ host: process.env.MARIADB_HOST, port: Number(process.env.MARIADB_PORT || 3306), user: process.env.MARIADB_USER, password: process.env.MARIADB_PASSWORD, database: databaseName, connectionLimit: 5 });
+    this.tenantPools.set(tenantId, tenantPool);
+    return tenantPool;
+  }
+  private async ensureTenantAiTables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS home_layout (id INT PRIMARY KEY, layout_json JSON NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS ai_credits (id INT PRIMARY KEY, credits_total INT NOT NULL, credits_used INT NOT NULL DEFAULT 0, enabled TINYINT(1) NOT NULL DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+  }
+  async getHomeLayout(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureTenantAiTables(tenantPool);
+    const rows = await tenantPool.query("SELECT layout_json AS layoutJson FROM home_layout WHERE id = 1 LIMIT 1") as any[];
+    const raw = rows[0]?.layoutJson;
+    if (!raw) return [...DEFAULT_HOME_LAYOUT];
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? parsed : [...DEFAULT_HOME_LAYOUT];
+  }
+  async saveHomeLayout(tenantId: string, layout: string[]) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureTenantAiTables(tenantPool);
+    await tenantPool.query("INSERT INTO home_layout (id, layout_json) VALUES (1, ?) ON DUPLICATE KEY UPDATE layout_json = VALUES(layout_json)", [JSON.stringify(layout)]);
+    return [...layout];
+  }
+  async getAiCredits(tenantId: string, plan: PlanId): Promise<AiCredits> {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureTenantAiTables(tenantPool);
+    const rows = await tenantPool.query("SELECT credits_total AS total, credits_used AS used, enabled FROM ai_credits WHERE id = 1 LIMIT 1") as any[];
+    const row = rows[0];
+    if (!row) return { total: plans[plan].aiQuota, used: 0, remaining: plans[plan].aiQuota, enabled: true, custom: false };
+    return { total: row.total, used: row.used, remaining: Math.max(0, row.total - row.used), enabled: Boolean(row.enabled), custom: true };
+  }
+  async setAiCredits(tenantId: string, input: { total: number; enabled: boolean }): Promise<AiCredits> {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureTenantAiTables(tenantPool);
+    const existing = await tenantPool.query("SELECT credits_used AS used FROM ai_credits WHERE id = 1 LIMIT 1") as any[];
+    const used = existing[0]?.used ?? 0;
+    await tenantPool.query("INSERT INTO ai_credits (id, credits_total, credits_used, enabled) VALUES (1, ?, ?, ?) ON DUPLICATE KEY UPDATE credits_total = VALUES(credits_total), enabled = VALUES(enabled)", [input.total, used, input.enabled ? 1 : 0]);
+    return { total: input.total, used, remaining: Math.max(0, input.total - used), enabled: input.enabled, custom: true };
+  }
+  async consumeAiCredit(tenantId: string, plan: PlanId) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureTenantAiTables(tenantPool);
+    const before = await this.getAiCredits(tenantId, plan);
+    if (!before.enabled) return { ok: false, reason: "AI_DISABLED", credits: before };
+    if (before.used >= before.total) return { ok: false, reason: "AI_CREDITS_EXHAUSTED", credits: before };
+    if (before.custom) {
+      const result = await tenantPool.query("UPDATE ai_credits SET credits_used = credits_used + 1 WHERE id = 1 AND enabled = 1 AND credits_used < credits_total") as { affectedRows?: number };
+      if (!result.affectedRows) return { ok: false, reason: "AI_CREDITS_EXHAUSTED", credits: await this.getAiCredits(tenantId, plan) };
+      return { ok: true, credits: await this.getAiCredits(tenantId, plan) };
+    }
+    await tenantPool.query("INSERT INTO ai_credits (id, credits_total, credits_used, enabled) VALUES (1, ?, 1, 1)", [before.total]);
+    return { ok: true, credits: await this.getAiCredits(tenantId, plan) };
+  }
 }
 
 export async function createStore(): Promise<Store> {

@@ -3,7 +3,21 @@ import { z } from "zod";
 import { allPermissionCodes, plans } from "./catalog.js";
 import { signAccessToken, verifyAccessToken, verifyPassword, type AccessClaims, deviceFingerprint } from "./security.js";
 import { provisionTenant } from "./provision.js";
-import type { Store } from "./store.js";
+import { chatWithGroq } from "./ai.js";
+import { DEFAULT_HOME_LAYOUT, type Store } from "./store.js";
+
+function checkMasterKey(request: Request, response: Response): boolean {
+  const masterKey = process.env.MASTER_ADMIN_KEY;
+  if (!masterKey) { response.status(503).json({ error: "MASTER_PROVISIONING_DISABLED", message: "Set MASTER_ADMIN_KEY in the server env to enable Master Admin routes." }); return false; }
+  const provided = request.header("x-master-key") || "";
+  const keysMatch = provided.length === masterKey.length && (() => {
+    let diff = 0;
+    for (let i = 0; i < provided.length; i++) diff |= provided.charCodeAt(i) ^ masterKey.charCodeAt(i);
+    return diff === 0;
+  })();
+  if (!keysMatch) { response.status(403).json({ error: "MASTER_KEY_INVALID" }); return false; }
+  return true;
+}
 
 export interface RequestContext extends Request { auth?: AccessClaims; }
 
@@ -126,6 +140,27 @@ export function buildRouter(store: Store): Router {
     }
   });
 
+  // Master Admin AI credits control (per tenant, custom numbers).
+  // Master key gated, same as tenant provisioning. The tenant's own
+  // credits live in that tenant's database (MariaDB) or in memory
+  // (demo), never in another tenant's store.
+  router.get("/api/master/ai-credits", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenantId = typeof request.query.tenantId === "string" ? request.query.tenantId : "";
+    if (!tenantId) return response.status(400).json({ error: "TENANT_REQUIRED", message: "Pass ?tenantId= to read one tenant's AI credits." });
+    const tenant = await store.getTenant(tenantId);
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    return response.json({ tenantId, credits: await store.getAiCredits(tenantId, tenant.plan) });
+  });
+  router.post("/api/master/ai-credits", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ tenantId: z.string().min(2), creditsTotal: z.number().int().min(0).max(1000000), enabled: z.boolean() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const tenant = await store.getTenant(body.data.tenantId);
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    return response.json({ tenantId: body.data.tenantId, credits: await store.setAiCredits(body.data.tenantId, { total: body.data.creditsTotal, enabled: body.data.enabled }) });
+  });
+
   router.use("/api", requireAuth, tenantGuard(store));
 
   router.get("/api/me", async (request: RequestContext, response) => {
@@ -150,6 +185,55 @@ export function buildRouter(store: Store): Router {
     const changed = await store.revokeDevice(request.auth!.tenantId, deviceId); if (!changed) return response.status(404).json({ error: "DEVICE_NOT_FOUND" });
     response.json({ ok: true, deviceId });
   });
+  // Home layout (drag-drop, per tenant, server-saved). Layout is stored
+  // in the tenant's own database, so one tenant's order never leaks to
+  // another tenant. The client may not invent widget keys: the layout
+  // must contain exactly the default widget set, in any order.
+  router.get("/api/home/layout", async (request: RequestContext, response) => response.json({ tenantId: request.auth!.tenantId, layout: await store.getHomeLayout(request.auth!.tenantId) }));
+  router.post("/api/home/layout", async (request: RequestContext, response) => {
+    const body = z.object({ layout: z.array(z.string()).min(1).max(20) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const layout = body.data.layout;
+    const allowed = new Set<string>(DEFAULT_HOME_LAYOUT);
+    const unique = new Set(layout);
+    if (unique.size !== layout.length || layout.length !== DEFAULT_HOME_LAYOUT.length || layout.some((key) => !allowed.has(key))) {
+      return response.status(400).json({ error: "INVALID_LAYOUT", message: "Layout must contain each home widget exactly once.", allowed: [...DEFAULT_HOME_LAYOUT] });
+    }
+    return response.json({ tenantId: request.auth!.tenantId, layout: await store.saveHomeLayout(request.auth!.tenantId, layout) });
+  });
+
+  // AI credits (own tenant only) and AI chat (Groq, env key only).
+  // Credits are per tenant: 1 chat request = 1 credit. Credits are checked
+  // before calling Groq and consumed only on a successful answer, so a
+  // provider failure does not cost a credit. If the server has no Groq
+  // key, chat returns 503 and consumes nothing — never a fake answer.
+  router.get("/api/ai/credits", async (request: RequestContext, response) => response.json({ tenantId: request.auth!.tenantId, credits: await store.getAiCredits(request.auth!.tenantId, request.auth!.plan) }));
+  router.post("/api/ai/chat", async (request: RequestContext, response) => {
+    const body = z.object({
+      message: z.string().min(1).max(2000),
+      history: z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().min(1).max(2000) })).max(8).optional(),
+    }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const tenant = response.locals.tenant;
+    const creditsBefore = await store.getAiCredits(request.auth!.tenantId, request.auth!.plan);
+    if (!creditsBefore.enabled) return response.status(403).json({ error: "AI_DISABLED", message: "AI is disabled for this tenant. Ask Master Admin to enable it." });
+    if (creditsBefore.used >= creditsBefore.total) return response.status(403).json({ error: "AI_CREDITS_EXHAUSTED", message: "AI credits are finished for this tenant. Ask Master Admin for more credits.", credits: creditsBefore });
+    if (!process.env.GROQ_API_KEY) return response.status(503).json({ error: "AI_NOT_CONFIGURED", message: "AI is not configured on the server yet. Master Admin must set GROQ_API_KEY in the server env.", credits: creditsBefore });
+    const dashboard = await store.getDashboard(request.auth!.tenantId);
+    const context = `Pharmacy: ${tenant.name} (${tenant.plan} plan). Branches: ${tenant.branches.map((b: { name: string }) => b.name).join(", ") || "none"}. Dashboard summary: revenue ${dashboard.revenue}, profit ${dashboard.profit}, low stock ${dashboard.lowStock}, expiring soon ${dashboard.expiringSoon}, total SKUs ${dashboard.totalSkus}.`;
+    try {
+      const history = body.data.history ?? [];
+      const result = await chatWithGroq([...history, { role: "user", content: body.data.message }], context);
+      const consumed = await store.consumeAiCredit(request.auth!.tenantId, request.auth!.plan);
+      if (!consumed.ok) return response.status(403).json({ error: consumed.reason, message: "AI credits ran out while answering. The answer was not returned and the request was not counted twice.", credits: consumed.credits });
+      return response.json({ answer: result.answer, model: result.model, credits: consumed.credits });
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "AI_PROVIDER_ERROR";
+      if (code === "AI_NOT_CONFIGURED") return response.status(503).json({ error: code, message: "AI is not configured on the server yet." });
+      return response.status(502).json({ error: "AI_PROVIDER_ERROR", message: "The AI provider could not answer right now. No credit was consumed." });
+    }
+  });
+
   // Phase 0 honesty fix: sync health must not return a random cursor, and
   // sync push must not pretend a record was saved when it was not.
   // Cursor-based offline sync storage lands in Phase 6. Until then, clients

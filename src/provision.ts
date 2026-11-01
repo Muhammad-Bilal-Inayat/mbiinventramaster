@@ -117,6 +117,14 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
       "INSERT INTO tenant_settings (setting_key, setting_value) VALUES ('plan', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
       [JSON.stringify(input.plan)],
     );
+    // AI + home layout tables for the new tenant (also created on demand
+    // by the store for older tenants, see migration 004).
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS home_layout (id INT PRIMARY KEY, layout_json JSON NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS ai_credits (id INT PRIMARY KEY, credits_total INT NOT NULL, credits_used INT NOT NULL DEFAULT 0, enabled TINYINT(1) NOT NULL DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    await tenantPool.query(
+      "INSERT INTO ai_credits (id, credits_total, credits_used, enabled) VALUES (1, ?, 0, 1)",
+      [plans[input.plan].aiQuota],
+    );
 
     // 4. Master registry + login index, written last.
     const branchSummary = JSON.stringify([{ id: branchId, name: input.branchName, city: input.branchCity || "" }]);
