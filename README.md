@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 5 slice 1: Auto-setup + Master panel + Public registration (local, not pushed yet)
+## Phase 5 slice 1: Auto-setup + Master panel + Public registration (pushed, commit 8da927c)
 
 - Auto-setup: on MariaDB boot (and again before provisioning) the app
   creates the registry tables itself (tenants, tenant_user_index,
