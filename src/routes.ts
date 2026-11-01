@@ -192,6 +192,101 @@ export function buildRouter(store: Store): Router {
     return response.json({ audit: await masterRegistry.listAudit(tenantId) });
   });
 
+  // Master control menus (Phase 5, /server only). These endpoints control
+  // tenants only — status, plan, devices, domains, support notes — and
+  // never return tenant business data (no sales, orders or inventory).
+  router.get("/api/master/health", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try {
+      const database = await store.pingDatabase();
+      const tenants = await store.listTenants();
+      const licenses = await masterRegistry.listLicenses({});
+      const byPlan: Record<string, number> = { basic: 0, advanced: 0 };
+      const byStatus: Record<string, number> = {};
+      for (const t of tenants) { byPlan[t.plan] = (byPlan[t.plan] ?? 0) + 1; byStatus[t.status] = (byStatus[t.status] ?? 0) + 1; }
+      const byLicense: Record<string, number> = {};
+      for (const l of licenses) byLicense[l.effectiveStatus] = (byLicense[l.effectiveStatus] ?? 0) + 1;
+      const expiringSoon = (await masterRegistry.listLicenses({ expiringSoon: true })).length;
+      let devices = 0;
+      for (const t of tenants) { try { devices += (await store.listDevices(t.id)).length; } catch { /* one tenant's devices must not break health */ } }
+      return response.json({ database, tenants: tenants.length, byPlan, byStatus, licenses: licenses.length, byLicense, expiringSoon, devices, generatedAt: new Date().toISOString() });
+    } catch { return response.status(503).json({ error: "MASTER_HEALTH_FAILED" }); }
+  });
+  router.get("/api/master/tenants/:tenantId/devices", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    return response.json({ tenantId: tenant.id, devices: await store.listDevices(tenant.id) });
+  });
+  router.post("/api/master/tenants/:tenantId/devices/:deviceId/revoke", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const changed = await store.revokeDevice(tenant.id, String(request.params.deviceId));
+    if (!changed) return response.status(404).json({ error: "DEVICE_NOT_FOUND" });
+    await masterRegistry.logAudit("device.revoked", tenant.id, { deviceId: String(request.params.deviceId) });
+    return response.json({ ok: true, deviceId: String(request.params.deviceId) });
+  });
+  router.post("/api/master/tenants/:tenantId/status", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ status: z.enum(["active", "locked", "maintenance"]) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    const changed = await store.setTenantStatus(String(request.params.tenantId), body.data.status);
+    if (!changed) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    await masterRegistry.logAudit("tenant.status", String(request.params.tenantId), { status: body.data.status });
+    return response.json({ tenantId: String(request.params.tenantId), status: body.data.status });
+  });
+  router.post("/api/master/tenants/:tenantId/plan", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ plan: z.enum(["basic", "advanced"]) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    const changed = await store.setTenantPlan(String(request.params.tenantId), body.data.plan);
+    if (!changed) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const license = await masterRegistry.getTenantLicense(String(request.params.tenantId));
+    if (license) await masterRegistry.actLicense(license.id, "update", { plan: body.data.plan });
+    await masterRegistry.logAudit("tenant.plan", String(request.params.tenantId), { plan: body.data.plan });
+    return response.json({ tenantId: String(request.params.tenantId), plan: body.data.plan });
+  });
+  router.get("/api/master/tenants/:tenantId/domains", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    return response.json({ tenantId: tenant.id, domains: await masterRegistry.listDomains(tenant.id), dnsVerification: "not built" });
+  });
+  router.post("/api/master/tenants/:tenantId/domains", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const body = z.object({ hostname: z.string().min(3).max(255) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    try { return response.status(201).json({ domain: await masterRegistry.addDomain(tenant.id, body.data.hostname) }); } catch (error) {
+      const code = error instanceof Error ? error.message : "DOMAIN_FAILED";
+      return response.status(code === "DOMAIN_ALREADY_EXISTS" ? 409 : code === "INVALID_HOSTNAME" ? 400 : 500).json({ error: code });
+    }
+  });
+  router.delete("/api/master/tenants/:tenantId/domains/:domainId", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const removed = await masterRegistry.removeDomain(tenant.id, String(request.params.domainId));
+    if (!removed) return response.status(404).json({ error: "DOMAIN_NOT_FOUND" });
+    return response.json({ ok: true });
+  });
+  router.get("/api/master/tenants/:tenantId/note", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    return response.json({ tenantId: tenant.id, note: await masterRegistry.getSupportNote(tenant.id) });
+  });
+  router.post("/api/master/tenants/:tenantId/note", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const body = z.object({ note: z.string().max(5000) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    return response.json({ tenantId: tenant.id, note: await masterRegistry.setSupportNote(tenant.id, body.data.note) });
+  });
+
   // Phase 5 slice 1 — Public registration. Owner decision after pushback:
   // anyone may register a pharmacy, but the guardrails stay: plan is forced
   // to Basic (Advanced is a master-panel upgrade, so public signups cannot

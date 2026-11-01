@@ -231,7 +231,7 @@ class MasterRegistry {
     return record;
   }
 
-  async actLicense(id: string, action: "suspend" | "reactivate" | "revoke" | "extend" | "assign", payload: { expiryDate?: string | null; lifetime?: boolean; tenantId?: string; notes?: string | null; plan?: PlanId; maxDevices?: number | null } = {}): Promise<LicenseRecord> {
+  async actLicense(id: string, action: "suspend" | "reactivate" | "revoke" | "extend" | "assign" | "update", payload: { expiryDate?: string | null; lifetime?: boolean; tenantId?: string; notes?: string | null; plan?: PlanId; maxDevices?: number | null } = {}): Promise<LicenseRecord> {
     const license = await this.getLicense(id);
     if (!license) throw new Error("LICENSE_NOT_FOUND");
     let nextStatus = license.status;
@@ -241,7 +241,9 @@ class MasterRegistry {
     let nextNotes = license.notes;
     let nextPlan = license.plan;
     let nextMax = license.maxDevices;
-    if (action === "suspend") {
+    if (action === "update") {
+      // Field-only update: no status, tenant or expiry change.
+    } else if (action === "suspend") {
       if (license.status !== "active") throw new Error("INVALID_TRANSITION");
       nextStatus = "suspended";
     } else if (action === "reactivate") {

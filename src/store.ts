@@ -217,6 +217,8 @@ export interface Store {
   findUser(login: string): Promise<UserRecord | undefined>;
   getTenant(tenantId: string): Promise<TenantRecord | undefined>;
   listTenants(): Promise<Array<{ id: string; name: string; plan: string; status: string; databaseName: string; features: { onlineStore: boolean } }>>;
+  setTenantStatus(tenantId: string, status: "active" | "locked" | "maintenance"): Promise<boolean>;
+  setTenantPlan(tenantId: string, plan: PlanId): Promise<boolean>;
   getUser(userId: string): Promise<UserRecord | undefined>;
   listDevices(tenantId: string): Promise<DeviceRecord[]>;
   registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">): Promise<DeviceRecord>;
@@ -328,6 +330,14 @@ class MemoryStore implements Store {
   async getTenant(tenantId: string) { return this.tenants.get(tenantId); }
   async listTenants() { return [...this.tenants.values()].map((t) => ({ id: t.id, name: t.name, plan: t.plan, status: t.status, databaseName: t.id, features: { onlineStore: this.tenantFeatures.get(t.id)?.onlineStore ?? true } })); }
   async getUser(userId: string) { return this.users.get(userId); }
+  async setTenantStatus(tenantId: string, status: "active" | "locked" | "maintenance") {
+    const tenant = this.tenants.get(tenantId); if (!tenant) return false;
+    tenant.status = status; return true;
+  }
+  async setTenantPlan(tenantId: string, plan: PlanId) {
+    const tenant = this.tenants.get(tenantId); if (!tenant) return false;
+    tenant.plan = plan; return true;
+  }
   async listDevices(tenantId: string) { return [...this.devices.values()].filter((device) => device.tenantId === tenantId); }
   async registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">) {
     const device: DeviceRecord = { ...input, id: randomId("device"), status: "active", lastSeen: new Date().toISOString() };
@@ -1076,6 +1086,14 @@ class MariaDbHealthStore implements Store {
     const rows = await this.pool.query("SELECT user_id AS id, tenant_id AS tenantId, name, login, password_hash AS passwordHash, role, branch_ids_json AS branchIds, permissions_json AS permissions, active FROM tenant_user_index WHERE user_id = ? LIMIT 1", [userId]) as any[];
     const row = rows[0]; if (!row) return undefined;
     return { ...row, branchIds: typeof row.branchIds === "string" ? JSON.parse(row.branchIds) : row.branchIds, permissions: typeof row.permissions === "string" ? JSON.parse(row.permissions) : row.permissions } as UserRecord;
+  }
+  async setTenantStatus(tenantId: string, status: "active" | "locked" | "maintenance") {
+    const result = await this.pool.query("UPDATE tenants SET status = ? WHERE id = ?", [status, tenantId]) as { affectedRows?: number };
+    return Boolean(result.affectedRows);
+  }
+  async setTenantPlan(tenantId: string, plan: PlanId) {
+    const result = await this.pool.query("UPDATE tenants SET plan = ? WHERE id = ?", [plan, tenantId]) as { affectedRows?: number };
+    return Boolean(result.affectedRows);
   }
   async listDevices(tenantId: string) {
     const rows = await this.pool.query("SELECT id, tenant_id AS tenantId, user_id AS userId, device_name AS name, hwid_hash AS hwidHash, status, last_seen_at AS lastSeen FROM tenant_devices WHERE tenant_id = ? ORDER BY created_at DESC", [tenantId]) as any[];
