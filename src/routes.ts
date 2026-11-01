@@ -299,6 +299,69 @@ export function buildRouter(store: Store): Router {
     return response.json({ batch });
   });
 
+  // Phase 3 — POS, Purchases, Khata. Sales and purchases are tenant-scoped,
+  // branch-checked, and written with inventory + khata in one transaction
+  // (MariaDB) or one pre-checked step (memory). Discount needs sales.discount;
+  // approval needs purchases.approve; a pending purchase adds no stock.
+  function mapPhase3Error(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "PHASE3_ERROR";
+    const map: Record<string, number> = { PARTY_NOT_FOUND: 404, SALE_NOT_FOUND: 404, PURCHASE_NOT_FOUND: 404, MEDICINE_NOT_FOUND: 404, RETURN_ITEM_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_DISCOUNT: 400, PAYMENT_MISMATCH: 400, INVALID_AMOUNT: 400, INVALID_ITEMS: 400, CUSTOMER_REQUIRED: 400, RETURN_EXCEEDS_SOLD: 400, ALREADY_RETURNED: 409, ALREADY_APPROVED: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    const status = map[code] ?? 500;
+    return response.status(status).json({ error: code, message: code === "INSUFFICIENT_STOCK" ? "Not enough stock in this branch for this sale. Nothing was sold." : code === "CUSTOMER_REQUIRED" ? "A credit sale needs a customer." : code === "PAYMENT_MISMATCH" ? "Paid amount does not match this sale or purchase total." : "Phase 3 operation failed." });
+  }
+  router.get("/api/parties", requirePermission("parties.view"), async (request: RequestContext, response) => {
+    const type = typeof request.query.type === "string" ? request.query.type : undefined;
+    return response.json({ parties: await store.listParties(request.auth!.tenantId, type) });
+  });
+  router.post("/api/parties", requirePermission("parties.view"), async (request: RequestContext, response) => {
+    const body = z.object({ type: z.enum(["customer", "supplier"]), name: z.string().min(1).max(220), phone: z.string().max(40).nullable().optional(), address: z.string().max(400).nullable().optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    return response.status(201).json({ party: await store.createParty(request.auth!.tenantId, body.data) });
+  });
+  router.get("/api/parties/:id/statement", requirePermission("parties.view"), async (request: RequestContext, response) => {
+    try { return response.json(await store.getPartyBalance(request.auth!.tenantId, String(request.params.id))); } catch (error) { return mapPhase3Error(error, response); }
+  });
+  router.post("/api/parties/:id/pay", requirePermission("parties.payment"), async (request: RequestContext, response) => {
+    const body = z.object({ amount: z.number().positive(), note: z.string().max(400).nullable().optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try { return response.json({ entry: await store.payParty(request.auth!.tenantId, request.auth!.sub, { partyId: String(request.params.id), amount: body.data.amount, note: body.data.note }) }); } catch (error) { return mapPhase3Error(error, response); }
+  });
+  router.get("/api/sales", requirePermission("sales.view"), async (request: RequestContext, response) => response.json({ sales: await store.listSales(request.auth!.tenantId) }));
+  router.get("/api/sales/:id", requirePermission("sales.view"), async (request: RequestContext, response) => {
+    const sale = await store.getSale(request.auth!.tenantId, String(request.params.id));
+    if (!sale) return response.status(404).json({ error: "SALE_NOT_FOUND" });
+    return response.json({ sale });
+  });
+  router.post("/api/sales", requirePermission("sales.create"), async (request: RequestContext, response) => {
+    const body = z.object({ branchId: z.string().min(1), customerId: z.string().min(1).nullable().optional(), items: z.array(z.object({ medicineId: z.string().min(1), quantity: z.number().int().positive() })).min(1).max(100), discount: z.number().min(0).default(0), paymentType: z.enum(["cash", "credit"]), paidAmount: z.number().min(0) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    if (body.data.discount > 0 && !request.auth!.permissions.includes("sales.discount" as never)) return response.status(403).json({ error: "PERMISSION_DENIED", message: "Your account does not have discount permission." });
+    try { return response.status(201).json({ sale: await store.createSale(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapPhase3Error(error, response); }
+  });
+  router.post("/api/sales/:id/return", requirePermission("sales.refund"), async (request: RequestContext, response) => {
+    const body = z.object({ items: z.array(z.object({ medicineId: z.string().min(1), batchId: z.string().min(1), quantity: z.number().int().positive() })).min(1).max(100) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const existing = await store.getSale(request.auth!.tenantId, String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "SALE_NOT_FOUND" });
+    if (!branchAccess(request, existing.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ sale: await store.returnSale(request.auth!.tenantId, request.auth!.sub, String(request.params.id), body.data.items) }); } catch (error) { return mapPhase3Error(error, response); }
+  });
+  router.get("/api/purchases", requirePermission("purchases.view"), async (request: RequestContext, response) => response.json({ purchases: await store.listPurchases(request.auth!.tenantId) }));
+  router.post("/api/purchases", requirePermission("purchases.create"), async (request: RequestContext, response) => {
+    const body = z.object({ branchId: z.string().min(1), supplierId: z.string().min(1), items: z.array(z.object({ medicineId: z.string().min(1), batchNo: z.string().min(1).max(96), expiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), purchasePrice: z.number().min(0), salePrice: z.number().min(0), quantity: z.number().int().positive() })).min(1).max(100), paidAmount: z.number().min(0).default(0) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    const approved = request.auth!.permissions.includes("purchases.approve" as never);
+    try { return response.status(201).json({ purchase: await store.createPurchase(request.auth!.tenantId, request.auth!.sub, { ...body.data, approved }) }); } catch (error) { return mapPhase3Error(error, response); }
+  });
+  router.post("/api/purchases/:id/approve", requirePermission("purchases.approve"), async (request: RequestContext, response) => {
+    const existing = (await store.listPurchases(request.auth!.tenantId)).find((x) => x.id === String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "PURCHASE_NOT_FOUND" });
+    if (!branchAccess(request, existing.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ purchase: await store.approvePurchase(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase3Error(error, response); }
+  });
+
   // Phase 0 honesty fix: sync health must not return a random cursor, and
   // sync push must not pretend a record was saved when it was not.
   // Cursor-based offline sync storage lands in Phase 6. Until then, clients

@@ -116,8 +116,121 @@ async function renderInventory() {
   loadMedicines(); loadAlerts();
 }
 
+
+async function renderSales() {
+  const branches = state.me.tenant.branches.map(b => '<option value="' + b.id + '">' + b.name + '</option>').join('');
+  document.querySelector('#mainContent').innerHTML =
+    '<div class="topbar"><div><div class="eyebrow">SALES / POS</div><h1 class="headline">Point of sale</h1><p class="subhead">FEFO sale: sab se pehle expire hone wala batch pehle bikta hai. Sale, stock aur khata aik transaction me likhe jate hain. Stock kabhi negative nahi hota.</p></div></div>' +
+    '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">New sale</h2></div><div style="display:flex;gap:8px;margin-bottom:12px"><select id="saleBranch" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><input id="saleMedSearch" placeholder="Search medicine (name / SKU)" style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" id="saleSearchBtn">Search</button></div><div id="saleMedList"><p>Search a medicine, then add it to the cart.</p></div><div id="saleCart" style="margin-top:12px"></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px"><select id="saleCustomer" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="">No customer (cash sale)</option></select><select id="salePayType" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="cash">Cash (full payment)</option><option value="credit">Credit (khata)</option></select><input id="saleDiscount" type="number" step="0.01" min="0" value="0" placeholder="Discount Rs." style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input id="salePaid" type="number" step="0.01" min="0" value="0" placeholder="Paid amount Rs." style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /></div><p style="font-size:12px;color:#627d98">Cash sale me paid amount total ke barabar hona chahiye. Credit sale me baqi amount customer ke khata me jayega. Discount sirf un users ko milega jin ke paas discount permission hai.</p><button class="btn primary" id="saleSubmit" style="margin-top:8px">Complete sale</button><div id="saleResult" style="margin-top:12px"></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Recent sales</h2></div><div id="saleList"><p>Loading...</p></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Return sale item</h2></div><form id="saleReturnForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="saleId" placeholder="Sale ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="medicineId" placeholder="Medicine ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="batchId" placeholder="Batch ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="quantity" type="number" step="1" min="1" placeholder="Return qty *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Return item</button></form><p style="font-size:12px;color:#627d98">Return stock wapas ata hai, khata balance kam hota hai (credit sale par), aur refund discount ke hisab se hota hai.</p></section>';
+  const cart = [];
+  function renderCart() {
+    const box = document.querySelector('#saleCart'); if (!box) return;
+    if (!cart.length) { box.innerHTML = '<p>Cart is empty.</p>'; return; }
+    box.innerHTML = '<table class="table"><thead><tr><th>Medicine</th><th>Qty</th><th></th></tr></thead><tbody>' + cart.map((c, i) => '<tr><td><strong>' + c.name + '</strong></td><td>' + c.quantity + '</td><td><button class="btn" data-cart-remove="' + i + '">Remove</button></td></tr>').join('') + '</tbody></table>';
+    box.querySelectorAll('[data-cart-remove]').forEach(btn => btn.addEventListener('click', () => { cart.splice(Number(btn.dataset.cartRemove), 1); renderCart(); }));
+  }
+  renderCart();
+  async function loadCustomers() {
+    try { const d = await api('/api/parties?type=customer'); const sel = document.querySelector('#saleCustomer'); if (sel) sel.innerHTML = '<option value="">No customer (cash sale)</option>' + d.parties.map(x => '<option value="' + x.id + '">' + x.name + '</option>').join(''); } catch (e) {}
+  }
+  loadCustomers();
+  document.querySelector('#saleSearchBtn').addEventListener('click', async () => {
+    const q = document.querySelector('#saleMedSearch').value;
+    const data = await api('/api/inventory/medicines?search=' + encodeURIComponent(q));
+    const box = document.querySelector('#saleMedList');
+    if (!data.medicines.length) { box.innerHTML = '<p>No medicine found.</p>'; return; }
+    box.innerHTML = data.medicines.map(m => '<div class="activity"><div><strong>' + m.name + '</strong><span>SKU ' + m.sku + ' - Stock ' + m.totalStock + '</span></div><input type="number" min="1" value="1" data-qty="' + m.id + '" style="width:70px;padding:8px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" data-add="' + m.id + '" data-name="' + m.name + '">Add</button></div>').join('');
+    box.querySelectorAll('[data-add]').forEach(btn => btn.addEventListener('click', () => {
+      const qtyEl = box.querySelector('[data-qty="' + btn.dataset.add + '"]');
+      const qty = Number(qtyEl ? qtyEl.value : 1);
+      if (!(qty > 0)) return alert('Quantity must be positive.');
+      const existing = cart.find(c => c.medicineId === btn.dataset.add); if (existing) existing.quantity += qty; else cart.push({ medicineId: btn.dataset.add, name: btn.dataset.name, quantity: qty });
+      renderCart();
+    }));
+  });
+  async function loadSales() {
+    try {
+      const data = await api('/api/sales');
+      const box = document.querySelector('#saleList'); if (!box) return;
+      if (!data.sales.length) { box.innerHTML = '<p>No sales yet.</p>'; return; }
+      box.innerHTML = data.sales.slice(0, 20).map(x => '<div class="activity"><div><strong>' + x.invoiceNo + ' - ' + money(x.total) + '</strong><span>' + x.paymentType + ' - Paid ' + money(x.paidAmount) + ' - Balance ' + money(x.balanceDue) + ' - Status ' + x.status + ' - Items: ' + x.items.map(i => i.batchNo + ' x' + i.quantity + ' @ Rs. ' + i.unitPrice).join(', ') + '</span></div></div>').join('');
+    } catch (e) { const box = document.querySelector('#saleList'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  loadSales();
+  document.querySelector('#saleSubmit').addEventListener('click', async () => {
+    if (!cart.length) return alert('Cart is empty.');
+    const body = { branchId: document.querySelector('#saleBranch').value, customerId: document.querySelector('#saleCustomer').value || null, items: cart.map(c => ({ medicineId: c.medicineId, quantity: c.quantity })), discount: Number(document.querySelector('#saleDiscount').value || 0), paymentType: document.querySelector('#salePayType').value, paidAmount: Number(document.querySelector('#salePaid').value || 0) };
+    try {
+      const data = await api('/api/sales', { method: 'POST', body: JSON.stringify(body) });
+      document.querySelector('#saleResult').innerHTML = '<p>Sale completed: <strong>' + data.sale.invoiceNo + '</strong> - Total ' + money(data.sale.total) + ' - Balance ' + money(data.sale.balanceDue) + '</p>';
+      cart.length = 0; renderCart(); loadSales();
+    } catch (e) { alert(e.message); }
+  });
+  document.querySelector('#saleReturnForm').addEventListener('submit', async (e) => {
+    e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); f.quantity = Number(f.quantity);
+    try { const data = await api('/api/sales/' + f.saleId + '/return', { method: 'POST', body: JSON.stringify({ items: [{ medicineId: f.medicineId, batchId: f.batchId, quantity: f.quantity }] }) }); alert('Returned. Sale status: ' + data.sale.status); loadSales(); } catch (err) { alert(err.message); }
+  });
+}
+
+async function renderPurchases() {
+  const branches = state.me.tenant.branches.map(b => '<option value="' + b.id + '">' + b.name + '</option>').join('');
+  document.querySelector('#mainContent').innerHTML =
+    '<div class="topbar"><div><div class="eyebrow">PURCHASES & KHATA</div><h1 class="headline">Purchases & khata</h1><p class="subhead">Supplier purchase, approval, supplier payment, customer aur supplier ka khata — sab aik jagah, inventory aur dashboard se sync.</p></div></div>' +
+    '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">Parties (customer / supplier)</h2></div><form id="partyForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><select name="type" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="customer">Customer</option><option value="supplier">Supplier</option></select><input name="name" placeholder="Name *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="phone" placeholder="Phone" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="address" placeholder="Address" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Add party</button></form><div id="partyList" style="margin-top:12px"><p>Loading...</p></div><div id="partyStatement" style="margin-top:12px"></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">New purchase</h2></div><div style="display:flex;gap:8px;margin-bottom:12px"><select id="purBranch" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><select id="purSupplier" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="">Select supplier</option></select></div><form id="purItemForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="medicineId" placeholder="Medicine ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="batchNo" placeholder="Batch no *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="expiryDate" type="date" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="purchasePrice" type="number" step="0.01" min="0" placeholder="Purchase price *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="salePrice" type="number" step="0.01" min="0" placeholder="Sale price *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="quantity" type="number" step="1" min="1" placeholder="Qty *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn" type="submit">Add item</button></form><div id="purCart" style="margin-top:12px"></div><div style="display:flex;gap:8px;margin-top:12px"><input id="purPaid" type="number" step="0.01" min="0" value="0" placeholder="Paid amount Rs." style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" id="purSubmit">Create purchase</button></div><p style="font-size:12px;color:#627d98">Agar aap ke paas approve permission hai to purchase foran approved hogi aur stock ayega. Warna purchase pending rahegi — stock aur khata tabhi ayenge jab koi approver approve karega.</p></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Purchases</h2></div><div id="purList"><p>Loading...</p></div></section>';
+  const cart = [];
+  function renderPurCart() {
+    const box = document.querySelector('#purCart'); if (!box) return;
+    if (!cart.length) { box.innerHTML = '<p>No purchase items yet.</p>'; return; }
+    box.innerHTML = '<table class="table"><thead><tr><th>Medicine</th><th>Batch</th><th>Qty</th><th>Price</th></tr></thead><tbody>' + cart.map(c => '<tr><td>' + c.medicineId + '</td><td>' + c.batchNo + '</td><td>' + c.quantity + '</td><td>Rs. ' + c.purchasePrice + '</td></tr>').join('') + '</tbody></table>';
+  }
+  renderPurCart();
+  async function loadParties() {
+    try {
+      const data = await api('/api/parties');
+      const box = document.querySelector('#partyList'); if (!box) return;
+      if (!data.parties.length) { box.innerHTML = '<p>No parties yet.</p>'; return; }
+      box.innerHTML = data.parties.map(x => '<div class="activity"><div><strong>' + x.name + ' (' + x.type + ')</strong><span>' + (x.phone || '') + '</span></div><button class="btn" data-stmt="' + x.id + '">Statement</button></div>').join('');
+      box.querySelectorAll('[data-stmt]').forEach(btn => btn.addEventListener('click', async () => {
+        const st = await api('/api/parties/' + btn.dataset.stmt + '/statement');
+        const sb = document.querySelector('#partyStatement');
+        sb.innerHTML = '<h3>' + st.party.name + ' - Balance Rs. ' + st.balance + '</h3>' +
+          '<div style="display:flex;gap:8px;margin:8px 0"><input id="payAmount" type="number" step="0.01" min="0.01" placeholder="Payment amount" style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" id="payBtn">Record payment</button></div>' +
+          (st.entries.length ? st.entries.map(e => '<div class="activity"><div><strong>' + e.entryType + '</strong><span>Debit ' + e.debit + ' - Credit ' + e.credit + (e.note ? ' - ' + e.note : '') + '</span></div></div>').join('') : '<p>No khata entries yet.</p>');
+        document.querySelector('#payBtn').addEventListener('click', async () => {
+          const amount = Number(document.querySelector('#payAmount').value);
+          try { await api('/api/parties/' + btn.dataset.stmt + '/pay', { method: 'POST', body: JSON.stringify({ amount }) }); loadParties(); } catch (err) { alert(err.message); }
+        });
+      }));
+      const sel = document.querySelector('#purSupplier'); if (sel) sel.innerHTML = '<option value="">Select supplier</option>' + data.parties.filter(x => x.type === 'supplier').map(x => '<option value="' + x.id + '">' + x.name + '</option>').join('');
+    } catch (e) { const box = document.querySelector('#partyList'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  loadParties();
+  async function loadPurchases() {
+    try {
+      const data = await api('/api/purchases');
+      const box = document.querySelector('#purList'); if (!box) return;
+      if (!data.purchases.length) { box.innerHTML = '<p>No purchases yet.</p>'; return; }
+      box.innerHTML = data.purchases.slice(0, 20).map(x => '<div class="activity"><div><strong>Purchase - Rs. ' + x.subtotal + ' - ' + x.status + '</strong><span>Paid ' + money(x.paidAmount) + ' - Balance ' + money(x.balanceDue) + ' - Items: ' + x.items.map(i => i.batchNo + ' x' + i.quantity).join(', ') + '</span></div>' + (x.status === 'pending' ? '<button class="btn primary" data-approve="' + x.id + '">Approve</button>' : '') + '</div>').join('');
+      box.querySelectorAll('[data-approve]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/purchases/' + btn.dataset.approve + '/approve', { method: 'POST', body: JSON.stringify({}) }); loadPurchases(); } catch (err) { alert(err.message); } }));
+    } catch (e) { const box = document.querySelector('#purList'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  loadPurchases();
+  document.querySelector('#partyForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); try { await api('/api/parties', { method: 'POST', body: JSON.stringify(f) }); e.target.reset(); loadParties(); } catch (err) { alert(err.message); } });
+  document.querySelector('#purItemForm').addEventListener('submit', (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); f.purchasePrice = Number(f.purchasePrice); f.salePrice = Number(f.salePrice); f.quantity = Number(f.quantity); cart.push(f); renderPurCart(); e.target.reset(); });
+  document.querySelector('#purSubmit').addEventListener('click', async () => {
+    const supplierId = document.querySelector('#purSupplier').value;
+    if (!supplierId) return alert('Select a supplier.');
+    if (!cart.length) return alert('Add at least one purchase item.');
+    try { const data = await api('/api/purchases', { method: 'POST', body: JSON.stringify({ branchId: document.querySelector('#purBranch').value, supplierId, items: cart, paidAmount: Number(document.querySelector('#purPaid').value || 0) }) }); alert('Purchase created: ' + data.purchase.status); cart.length = 0; renderPurCart(); loadPurchases(); } catch (err) { alert(err.message); }
+  });
+}
+
 function bindApp() {
-  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
+  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
   document.querySelector('#refresh')?.addEventListener('click', async () => { state.dashboard = await api('/api/dashboard'); document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); const toast = document.querySelector('#toast'); toast.textContent = 'Dashboard refreshed.'; toast.style.display = 'block'; setTimeout(() => { toast.style.display = 'none'; }, 2600); });
   document.querySelector('#resetLayout')?.addEventListener('click', async () => { try { const r = await api('/api/home/layout', { method: 'POST', body: JSON.stringify({ layout: ["kpis", "branch", "alerts", "top", "activity", "command"] }) }); state.homeLayout = r.layout; document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); } catch (error) { alert(error.message); } });
   document.querySelectorAll('[data-widget]').forEach(el => {

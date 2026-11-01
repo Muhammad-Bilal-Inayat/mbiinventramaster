@@ -80,7 +80,42 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 2: Inventory core (local, not pushed yet)
+## Phase 3: POS, Purchases, Khata (local, not pushed yet)
+
+- POS sale: POST /api/sales (permission sales.create, branch access).
+  FEFO allocation across batches, invoice INV-000001 style, stock + movement
+  + audit + khata in one MariaDB transaction (pre-checked in memory).
+  Insufficient stock fails the whole sale, nothing is sold. Cash sale must be
+  fully paid; credit sale needs a customer and the balance goes to khata.
+  Discount > 0 needs sales.discount permission (403 otherwise).
+- Return: POST /api/sales/:id/return (sales.refund). Quantity over sold is
+  blocked, stock comes back, khata balance falls (credit sale), refund is
+  discount-apportioned. Any refund above the khata balance is a counter cash
+  refund, not a khata entry.
+- Parties & khata: POST/GET /api/parties, GET /api/parties/:id/statement,
+  POST /api/parties/:id/pay (parties.payment). Customer balance = debit -
+  credit, supplier balance = credit - debit. Payments are allocated FIFO to
+  the oldest open credit sales / purchases, so sale/purchase balanceDue and
+  khata balance stay the same truth.
+- Purchases: POST /api/purchases (purchases.create). If the creator has
+  purchases.approve, the purchase is approved at once and stock + supplier
+  khata move. Otherwise it stays pending — no stock, no khata — until
+  POST /api/purchases/:id/approve (purchases.approve, 403 for others, 409 on
+  double approve). Existing batch numbers keep their sale price; new batches
+  get the purchase's prices.
+- Menus sync: dashboard is no longer zeros in MariaDB — revenue, profit
+  (sales minus batch purchase cost), low/expiring counts, SKU count, branch
+  performance, top products (discount-apportioned, so top revenue sums to
+  dashboard revenue) and activity are all computed from the same sales,
+  purchases, stock and batch tables. Memory mode shows the same computed
+  dashboard once real sales/purchases exist; before that it shows the demo
+  preview, labelled as such in the UI.
+- Tables: db/migrations/005_tenant_pos_khata.sql (tenant DBs only), also
+  auto-created on first use. Frontend: Sales / POS page and Purchases &
+  Khata page are now real. Reports, Branches, Devices, Sync, Settings stay
+  Coming soon (Devices API already works; its page is not built yet).
+
+## Phase 2: Inventory core (pushed, commit a06ace2)
 
 - Medicines: POST/GET /api/inventory/medicines, POST /api/inventory/medicines/import
   (max 200, partial failures in failed[]), POST /api/inventory/medicines/:id/active

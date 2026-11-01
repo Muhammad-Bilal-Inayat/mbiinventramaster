@@ -53,6 +53,73 @@ export interface StockMovementRecord {
   serverVersion: number;
 }
 
+export interface PartyRecord {
+  id: string;
+  type: "customer" | "supplier";
+  name: string;
+  phone: string | null;
+  address: string | null;
+  active: boolean;
+}
+
+export interface SaleItemRecord {
+  medicineId: string;
+  batchId: string;
+  batchNo: string;
+  quantity: number;
+  unitPrice: number;
+  returnedQuantity: number;
+}
+
+export interface SaleRecord {
+  id: string;
+  invoiceNo: string;
+  branchId: string;
+  customerId: string | null;
+  subtotal: number;
+  discount: number;
+  total: number;
+  paidAmount: number;
+  balanceDue: number;
+  paymentType: "cash" | "credit";
+  status: "completed" | "partially_returned" | "returned";
+  items: SaleItemRecord[];
+  createdAt: string;
+}
+
+export interface PurchaseItemRecord {
+  medicineId: string;
+  batchId: string;
+  batchNo: string;
+  expiryDate: string;
+  quantity: number;
+  purchasePrice: number;
+  salePrice: number;
+}
+
+export interface PurchaseRecord {
+  id: string;
+  branchId: string;
+  supplierId: string;
+  subtotal: number;
+  paidAmount: number;
+  balanceDue: number;
+  status: "pending" | "approved";
+  items: PurchaseItemRecord[];
+  createdAt: string;
+}
+
+export interface KhataEntryRecord {
+  id: string;
+  partyId: string;
+  entryType: string;
+  debit: number;
+  credit: number;
+  referenceId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
 export interface TenantRecord {
   id: string;
   name: string;
@@ -116,6 +183,17 @@ export interface Store {
   adjustStock(tenantId: string, userId: string, input: { branchId: string; batchId: string; quantity: number; movementType: string; referenceId?: string | null; idempotencyKey: string; reorderLevel?: number }): Promise<StockMovementRecord>;
   getStockAlerts(tenantId: string): Promise<StockAlerts>;
   getFefoBatch(tenantId: string, medicineId: string, branchId: string): Promise<BatchRecord | undefined>;
+  createParty(tenantId: string, input: { type: "customer" | "supplier"; name: string; phone?: string | null; address?: string | null }): Promise<PartyRecord>;
+  listParties(tenantId: string, type?: string): Promise<PartyRecord[]>;
+  getPartyBalance(tenantId: string, partyId: string): Promise<{ party: PartyRecord; balance: number; entries: KhataEntryRecord[] }>;
+  payParty(tenantId: string, userId: string, input: { partyId: string; amount: number; note?: string | null }): Promise<KhataEntryRecord>;
+  createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }): Promise<SaleRecord>;
+  getSale(tenantId: string, saleId: string): Promise<SaleRecord | undefined>;
+  listSales(tenantId: string): Promise<SaleRecord[]>;
+  returnSale(tenantId: string, userId: string, saleId: string, items: Array<{ medicineId: string; batchId: string; quantity: number }>): Promise<SaleRecord>;
+  createPurchase(tenantId: string, userId: string, input: { branchId: string; supplierId: string; items: Array<{ medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number; quantity: number }>; paidAmount: number; approved: boolean }): Promise<PurchaseRecord>;
+  listPurchases(tenantId: string): Promise<PurchaseRecord[]>;
+  approvePurchase(tenantId: string, userId: string, purchaseId: string): Promise<PurchaseRecord>;
 }
 
 const ownerPermissions: PermissionCode[] = [
@@ -178,7 +256,29 @@ class MemoryStore implements Store {
     const device = this.devices.get(deviceId); if (!device || device.tenantId !== tenantId) return false;
     device.status = "revoked"; return true;
   }
-  async getDashboard(tenantId: string) { return this.dashboards.get(tenantId) ?? { revenue: 0, profit: 0, lowStock: 0, expiringSoon: 0, totalSkus: 0, branchPerformance: [], topProducts: [], activity: [] }; }
+  async getDashboard(tenantId: string) {
+    const hasReal = [...this.sales.values()].some((x) => x.tenantId === tenantId) || [...this.purchases.values()].some((x) => x.tenantId === tenantId);
+    if (!hasReal) return this.dashboards.get(tenantId) ?? { revenue: 0, profit: 0, lowStock: 0, expiringSoon: 0, totalSkus: 0, branchPerformance: [], topProducts: [], activity: [] };
+    const alerts = await this.getStockAlerts(tenantId);
+    const sales = [...this.sales.values()].filter((x) => x.tenantId === tenantId);
+    const revenue = sales.reduce((sum, x) => sum + x.total, 0);
+    const cost = sales.flatMap((x) => x.items).reduce((sum, i) => sum + i.quantity * (this.batches.get(i.batchId)?.purchasePrice ?? 0), 0);
+    const branchMap = new Map<string, { name: string; revenue: number; orders: number }>();
+    for (const sale of sales) {
+      const branch = this.tenants.get(tenantId)?.branches.find((b: any) => b.id === sale.branchId);
+      const entry = branchMap.get(sale.branchId) ?? { name: branch?.name ?? sale.branchId, revenue: 0, orders: 0 };
+      entry.revenue += sale.total; entry.orders += 1; branchMap.set(sale.branchId, entry);
+    }
+    const productMap = new Map<string, { name: string; units: number; revenue: number }>();
+    for (const sale of sales) for (const item of sale.items) {
+      const med = this.medicines.get(item.medicineId);
+      const entry = productMap.get(item.medicineId) ?? { name: med?.name ?? item.medicineId, units: 0, revenue: 0 };
+      const netRatio = sale.subtotal > 0 ? (1 - sale.discount / sale.subtotal) : 1;
+      entry.units += item.quantity; entry.revenue += item.quantity * item.unitPrice * netRatio; productMap.set(item.medicineId, entry);
+    }
+    const activity = [...sales.map((x) => ({ label: `Sale ${x.invoiceNo}`, detail: `Rs ${x.total} · ${x.branchId}`, time: x.createdAt, tone: "success" as const })), ...[...this.purchases.values()].filter((x) => x.tenantId === tenantId).map((x) => ({ label: `Purchase ${x.status}`, detail: `Rs ${x.subtotal} · ${x.branchId}`, time: x.createdAt, tone: "info" as const }))].sort((a, b) => b.time.localeCompare(a.time)).slice(0, 10);
+    return { revenue, profit: revenue - cost, lowStock: alerts.lowStock.length, expiringSoon: alerts.expiringSoon.length, totalSkus: [...this.medicines.values()].filter((m) => m.tenantId === tenantId && m.active).length, branchPerformance: [...branchMap.values()], topProducts: [...productMap.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 5), activity };
+  }
   async pingDatabase() { return { mode: "memory" as const, ok: true }; }
   private homeLayouts = new Map<string, string[]>();
   private aiCreditRows = new Map<string, { total: number; used: number; enabled: boolean; custom: boolean }>();
@@ -209,6 +309,33 @@ class MemoryStore implements Store {
   private stock = new Map<string, { quantity: number; reorderLevel: number }>();
   private movements: StockMovementRecord[] = [];
   private movementSeq = 0;
+  private parties = new Map<string, PartyRecord & { tenantId: string }>();
+  private sales = new Map<string, SaleRecord & { tenantId: string }>();
+  private purchases = new Map<string, PurchaseRecord & { tenantId: string }>();
+  private khata: KhataEntryRecord[] = [];
+  private saleSeq = 0;
+  private purchaseSeq = 0;
+  private partyToRecord(party: PartyRecord & { tenantId: string }): PartyRecord {
+    const { tenantId: _t, ...rest } = party; return rest;
+  }
+  private saleToRecord(sale: SaleRecord & { tenantId: string }): SaleRecord {
+    const { tenantId: _t, ...rest } = sale; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
+  private purchaseToRecord(pur: PurchaseRecord & { tenantId: string }): PurchaseRecord {
+    const { tenantId: _t, ...rest } = pur; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
+  private addKhata(tenantId: string, partyId: string, entryType: string, debit: number, credit: number, referenceId: string | null, note: string | null) {
+    const entry: KhataEntryRecord = { id: randomId("khata"), partyId, entryType, debit, credit, referenceId, note, createdAt: new Date().toISOString() };
+    this.khata.push(entry); return entry;
+  }
+  private partyBalance(tenantId: string, party: PartyRecord & { tenantId: string }) {
+    let balance = 0;
+    for (const e of this.khata) {
+      if (e.partyId !== party.id) continue;
+      balance += party.type === "supplier" ? (e.credit - e.debit) : (e.debit - e.credit);
+    }
+    return balance;
+  }
   private medicineTotalStock(tenantId: string, medicineId: string) {
     let total = 0;
     for (const batch of this.batches.values()) {
@@ -313,6 +440,174 @@ class MemoryStore implements Store {
     }
     return undefined;
   }
+  async createParty(tenantId: string, input: { type: "customer" | "supplier"; name: string; phone?: string | null; address?: string | null }) {
+    const party: PartyRecord & { tenantId: string } = { id: randomId("party"), tenantId, type: input.type, name: input.name, phone: input.phone ?? null, address: input.address ?? null, active: true };
+    this.parties.set(party.id, party); return this.partyToRecord(party);
+  }
+  async listParties(tenantId: string, type?: string) {
+    return [...this.parties.values()].filter((x) => x.tenantId === tenantId && (!type || x.type === type)).sort((a, b) => a.name.localeCompare(b.name)).map((x) => this.partyToRecord(x));
+  }
+  async getPartyBalance(tenantId: string, partyId: string) {
+    const party = this.parties.get(partyId);
+    if (!party || party.tenantId !== tenantId) throw new Error("PARTY_NOT_FOUND");
+    return { party: this.partyToRecord(party), balance: this.partyBalance(tenantId, party), entries: this.khata.filter((e) => e.partyId === partyId).map((e) => ({ ...e })) };
+  }
+  async payParty(tenantId: string, _userId: string, input: { partyId: string; amount: number; note?: string | null }) {
+    const party = this.parties.get(input.partyId);
+    if (!party || party.tenantId !== tenantId) throw new Error("PARTY_NOT_FOUND");
+    if (!(input.amount > 0)) throw new Error("INVALID_AMOUNT");
+    // customer pays us -> credit; we pay supplier -> debit. Both reduce the balance.
+    const entry = this.addKhata(tenantId, party.id, "payment", party.type === "supplier" ? input.amount : 0, party.type === "supplier" ? 0 : input.amount, null, input.note ?? null);
+    // Sync: a customer payment is allocated FIFO to that customer's oldest open
+    // credit sales, so sale list balanceDue and khata balance stay the same truth.
+    // A supplier payment is allocated FIFO to that supplier's oldest open purchases.
+    let remaining = input.amount;
+    if (party.type === "customer") {
+      for (const sale of [...this.sales.values()].filter((x) => x.tenantId === tenantId && x.customerId === party.id && x.balanceDue > 0).sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, sale.balanceDue); sale.balanceDue -= take; remaining -= take;
+      }
+    } else {
+      for (const pur of [...this.purchases.values()].filter((x) => x.tenantId === tenantId && x.supplierId === party.id && x.balanceDue > 0).sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, pur.balanceDue); pur.balanceDue -= take; remaining -= take;
+      }
+    }
+    return entry;
+  }
+  async createSale(tenantId: string, _userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
+    const today = new Date().toISOString().slice(0, 10);
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    if (input.paymentType === "credit" && !input.customerId) throw new Error("CUSTOMER_REQUIRED");
+    if (input.customerId) {
+      const party = this.parties.get(input.customerId);
+      if (!party || party.tenantId !== tenantId || party.type !== "customer") throw new Error("PARTY_NOT_FOUND");
+    }
+    // FEFO allocation, fully pre-checked before any stock moves.
+    const allocations: Array<{ medicineId: string; batchId: string; batchNo: string; quantity: number; unitPrice: number }> = [];
+    for (const item of input.items) {
+      const medicine = this.medicines.get(item.medicineId);
+      if (!medicine || medicine.tenantId !== tenantId || !medicine.active) throw new Error("MEDICINE_NOT_FOUND");
+      if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+      let remaining = item.quantity;
+      const candidates = [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === item.medicineId && b.expiryDate >= today).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+      for (const batch of candidates) {
+        if (remaining <= 0) break;
+        const row = this.stock.get(`${input.branchId}:${batch.id}`);
+        const avail = row?.quantity ?? 0;
+        if (avail <= 0) continue;
+        const take = Math.min(remaining, avail);
+        allocations.push({ medicineId: item.medicineId, batchId: batch.id, batchNo: batch.batchNo, quantity: take, unitPrice: batch.salePrice });
+        remaining -= take;
+      }
+      if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+    }
+    const subtotal = allocations.reduce((sum, a) => sum + a.quantity * a.unitPrice, 0);
+    if (input.discount < 0 || input.discount > subtotal) throw new Error("INVALID_DISCOUNT");
+    const total = subtotal - input.discount;
+    if (input.paidAmount < 0 || input.paidAmount > total) throw new Error("PAYMENT_MISMATCH");
+    if (input.paymentType === "cash" && input.paidAmount !== total) throw new Error("PAYMENT_MISMATCH");
+    const balanceDue = total - input.paidAmount;
+    this.saleSeq += 1;
+    const saleId = randomId("sale");
+    const invoiceNo = "INV-" + String(this.saleSeq).padStart(6, "0");
+    for (const a of allocations) {
+      const key = `${input.branchId}:${a.batchId}`;
+      const row = this.stock.get(key)!; row.quantity -= a.quantity; this.stock.set(key, row);
+      this.movementSeq += 1;
+      this.movements.push({ id: randomId("movement"), branchId: input.branchId, batchId: a.batchId, movementType: "sale", quantity: -a.quantity, referenceId: saleId, idempotencyKey: `sale-${saleId}-${a.batchId}`, serverVersion: this.movementSeq });
+    }
+    const sale: SaleRecord & { tenantId: string } = { id: saleId, tenantId, invoiceNo, branchId: input.branchId, customerId: input.customerId ?? null, subtotal, discount: input.discount, total, paidAmount: input.paidAmount, balanceDue, paymentType: input.paymentType, status: "completed", items: allocations.map((a) => ({ ...a, returnedQuantity: 0 })), createdAt: new Date().toISOString() };
+    this.sales.set(saleId, sale);
+    if (balanceDue > 0 && input.customerId) this.addKhata(tenantId, input.customerId, "sale_credit", balanceDue, 0, saleId, `Sale ${invoiceNo} credit`);
+    return this.saleToRecord(sale);
+  }
+  async getSale(tenantId: string, saleId: string) {
+    const sale = this.sales.get(saleId);
+    if (!sale || sale.tenantId !== tenantId) return undefined;
+    return this.saleToRecord(sale);
+  }
+  async listSales(tenantId: string) {
+    return [...this.sales.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => this.saleToRecord(x));
+  }
+  async returnSale(tenantId: string, _userId: string, saleId: string, items: Array<{ medicineId: string; batchId: string; quantity: number }>) {
+    const sale = this.sales.get(saleId);
+    if (!sale || sale.tenantId !== tenantId) throw new Error("SALE_NOT_FOUND");
+    if (sale.status === "returned") throw new Error("ALREADY_RETURNED");
+    let refund = 0;
+    for (const item of items) {
+      const line = sale.items.find((i) => i.medicineId === item.medicineId && i.batchId === item.batchId);
+      if (!line) throw new Error("RETURN_ITEM_NOT_FOUND");
+      if (!(item.quantity > 0) || item.quantity > line.quantity - line.returnedQuantity) throw new Error("RETURN_EXCEEDS_SOLD");
+      const discountRatio = sale.subtotal > 0 ? sale.discount / sale.subtotal : 0;
+      refund += item.quantity * line.unitPrice * (1 - discountRatio);
+    }
+    refund = Math.round(refund * 100) / 100;
+    for (const item of items) {
+      const line = sale.items.find((i) => i.medicineId === item.medicineId && i.batchId === item.batchId)!;
+      line.returnedQuantity += item.quantity;
+      const key = `${sale.branchId}:${item.batchId}`;
+      const row = this.stock.get(key) ?? { quantity: 0, reorderLevel: 0 }; row.quantity += item.quantity; this.stock.set(key, row);
+      this.movementSeq += 1;
+      this.movements.push({ id: randomId("movement"), branchId: sale.branchId, batchId: item.batchId, movementType: "return", quantity: item.quantity, referenceId: saleId, idempotencyKey: `return-${saleId}-${item.batchId}-${line.returnedQuantity}`, serverVersion: this.movementSeq });
+    }
+    if (sale.customerId && refund > 0) {
+      const party = this.parties.get(sale.customerId);
+      if (party) {
+        const balance = this.partyBalance(tenantId, party);
+        const credit = Math.min(refund, Math.max(0, balance));
+        if (credit > 0) { this.addKhata(tenantId, party.id, "sale_return", 0, credit, saleId, `Return on ${sale.invoiceNo}`); sale.balanceDue = Math.max(0, sale.balanceDue - credit); }
+      }
+    }
+    sale.status = sale.items.every((i) => i.returnedQuantity >= i.quantity) ? "returned" : "partially_returned";
+    return this.saleToRecord(sale);
+  }
+  async createPurchase(tenantId: string, _userId: string, input: { branchId: string; supplierId: string; items: Array<{ medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number; quantity: number }>; paidAmount: number; approved: boolean }) {
+    const supplier = this.parties.get(input.supplierId);
+    if (!supplier || supplier.tenantId !== tenantId || supplier.type !== "supplier") throw new Error("PARTY_NOT_FOUND");
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    for (const item of input.items) {
+      const medicine = this.medicines.get(item.medicineId);
+      if (!medicine || medicine.tenantId !== tenantId) throw new Error("MEDICINE_NOT_FOUND");
+      if (!(item.quantity > 0) || item.purchasePrice < 0 || item.salePrice < 0) throw new Error("INVALID_ITEMS");
+    }
+    const subtotal = input.items.reduce((sum, i) => sum + i.quantity * i.purchasePrice, 0);
+    if (input.paidAmount < 0 || input.paidAmount > subtotal) throw new Error("PAYMENT_MISMATCH");
+    const balanceDue = subtotal - input.paidAmount;
+    this.purchaseSeq += 1;
+    const purchaseId = randomId("purchase");
+    const purchaseItems: PurchaseItemRecord[] = input.items.map((i) => ({ medicineId: i.medicineId, batchId: "", batchNo: i.batchNo, expiryDate: i.expiryDate, quantity: i.quantity, purchasePrice: i.purchasePrice, salePrice: i.salePrice }));
+    const purchase: PurchaseRecord & { tenantId: string } = { id: purchaseId, tenantId, branchId: input.branchId, supplierId: input.supplierId, subtotal, paidAmount: input.paidAmount, balanceDue, status: input.approved ? "approved" : "pending", items: purchaseItems, createdAt: new Date().toISOString() };
+    this.purchases.set(purchaseId, purchase);
+    if (input.approved) this.applyPurchaseStock(tenantId, purchase);
+    return this.purchaseToRecord(purchase);
+  }
+  private applyPurchaseStock(tenantId: string, purchase: PurchaseRecord & { tenantId: string }) {
+    for (const item of purchase.items) {
+      let batch = [...this.batches.values()].find((b) => b.tenantId === tenantId && b.medicineId === item.medicineId && b.batchNo.toLowerCase() === item.batchNo.toLowerCase());
+      if (!batch) {
+        batch = { id: randomId("batch"), tenantId, medicineId: item.medicineId, batchNo: item.batchNo, expiryDate: item.expiryDate, purchasePrice: item.purchasePrice, salePrice: item.salePrice, stockByBranch: [] };
+        this.batches.set(batch.id, batch);
+      }
+      item.batchId = batch.id;
+      const key = `${purchase.branchId}:${batch.id}`;
+      const row = this.stock.get(key) ?? { quantity: 0, reorderLevel: 0 }; row.quantity += item.quantity; this.stock.set(key, row);
+      this.movementSeq += 1;
+      this.movements.push({ id: randomId("movement"), branchId: purchase.branchId, batchId: batch.id, movementType: "purchase", quantity: item.quantity, referenceId: purchase.id, idempotencyKey: `purchase-${purchase.id}-${batch.id}`, serverVersion: this.movementSeq });
+    }
+    if (purchase.balanceDue > 0) this.addKhata(tenantId, purchase.supplierId, "purchase_payable", 0, purchase.balanceDue, purchase.id, "Purchase payable");
+  }
+  async listPurchases(tenantId: string) {
+    return [...this.purchases.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => this.purchaseToRecord(x));
+  }
+  async approvePurchase(tenantId: string, _userId: string, purchaseId: string) {
+    const purchase = this.purchases.get(purchaseId);
+    if (!purchase || purchase.tenantId !== tenantId) throw new Error("PURCHASE_NOT_FOUND");
+    if (purchase.status === "approved") throw new Error("ALREADY_APPROVED");
+    purchase.status = "approved";
+    this.applyPurchaseStock(tenantId, purchase);
+    return this.purchaseToRecord(purchase);
+  }
 }
 
 class MariaDbHealthStore implements Store {
@@ -345,7 +640,24 @@ class MariaDbHealthStore implements Store {
     const result = await this.pool.query("UPDATE tenant_devices SET status = 'revoked' WHERE tenant_id = ? AND id = ?", [tenantId, deviceId]) as { affectedRows?: number };
     return Boolean(result.affectedRows);
   }
-  async getDashboard() { return { revenue: 0, profit: 0, lowStock: 0, expiringSoon: 0, totalSkus: 0, branchPerformance: [], topProducts: [], activity: [] }; }
+  async getDashboard(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    const tenant = await this.getTenant(tenantId);
+    const branchName = (id: string) => tenant?.branches.find((b: any) => b.id === id)?.name ?? id;
+    const revenueRows = await tenantPool.query("SELECT COALESCE(SUM(total), 0) AS revenue FROM sales") as any[];
+    const revenue = Number(revenueRows[0]?.revenue ?? 0);
+    const costRows = await tenantPool.query("SELECT COALESCE(SUM(si.quantity * b.purchase_price), 0) AS cost FROM sale_items si JOIN medicine_batches b ON b.id = si.batch_id") as any[];
+    const lowRows = await tenantPool.query("SELECT COUNT(*) AS n FROM branch_stock WHERE quantity > 0 AND quantity <= reorder_level") as any[];
+    const expRows = await tenantPool.query("SELECT COUNT(*) AS n FROM medicine_batches b WHERE EXISTS (SELECT 1 FROM branch_stock bs WHERE bs.batch_id = b.id AND bs.quantity > 0) AND b.expiry_date >= CURDATE() AND b.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 90 DAY)") as any[];
+    const skuRows = await tenantPool.query("SELECT COUNT(*) AS n FROM medicines WHERE active = TRUE") as any[];
+    const branchRows = await tenantPool.query("SELECT branch_id AS branchId, COALESCE(SUM(total), 0) AS revenue, COUNT(*) AS orders FROM sales GROUP BY branch_id") as any[];
+    const topRows = await tenantPool.query("SELECT m.name AS name, SUM(si.quantity) AS sold, SUM(si.quantity * si.unit_price * (1 - CASE WHEN s.subtotal > 0 THEN s.discount / s.subtotal ELSE 0 END)) AS revenue FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN medicines m ON m.id = si.medicine_id GROUP BY m.id ORDER BY revenue DESC LIMIT 5") as any[];
+    const saleAct = await tenantPool.query("SELECT invoice_no AS invoiceNo, total, branch_id AS branchId, created_at AS createdAt FROM sales ORDER BY created_at DESC LIMIT 5") as any[];
+    const purAct = await tenantPool.query("SELECT id, subtotal, branch_id AS branchId, status, created_at AS createdAt FROM purchases ORDER BY created_at DESC LIMIT 5") as any[];
+    const activity = [...saleAct.map((r: any) => ({ label: `Sale ${r.invoiceNo}`, detail: `Rs ${Number(r.total)} · ${branchName(r.branchId)}`, time: String(r.createdAt), tone: "success" as const })), ...purAct.map((r: any) => ({ label: `Purchase ${r.status}`, detail: `Rs ${Number(r.subtotal)} · ${branchName(r.branchId)}`, time: String(r.createdAt), tone: "info" as const }))].sort((a, b) => b.time.localeCompare(a.time)).slice(0, 10);
+    return { revenue, profit: revenue - Number(costRows[0]?.cost ?? 0), lowStock: Number(lowRows[0]?.n ?? 0), expiringSoon: Number(expRows[0]?.n ?? 0), totalSkus: Number(skuRows[0]?.n ?? 0), branchPerformance: branchRows.map((r: any) => ({ name: branchName(r.branchId), revenue: Number(r.revenue), orders: Number(r.orders) })), topProducts: topRows.map((r: any) => ({ name: r.name, units: Number(r.sold), revenue: Number(r.revenue) })), activity };
+  }
   async pingDatabase() { let connection; try { connection = await this.pool.getConnection(); await connection.query("SELECT 1"); return { mode: "mariadb" as const, ok: true }; } catch { return { mode: "mariadb" as const, ok: false }; } finally { connection?.release(); } }
   private tenantPools = new Map<string, ReturnType<typeof mariadb.createPool>>();
   private async getTenantPool(tenantId: string) {
@@ -529,6 +841,274 @@ class MariaDbHealthStore implements Store {
     const row = rows[0];
     if (!row) return undefined;
     return { id: row.id, medicineId: row.medicineId, batchNo: row.batchNo, expiryDate: String(row.expiryDate).slice(0, 10), purchasePrice: Number(row.purchasePrice), salePrice: Number(row.salePrice), stockByBranch: [{ branchId, quantity: Number(row.quantity), reorderLevel: 0 }] };
+  }
+  private async ensurePhase3Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS parties (id VARCHAR(96) PRIMARY KEY, type VARCHAR(20) NOT NULL, name VARCHAR(220) NOT NULL, phone VARCHAR(40) NULL, address VARCHAR(400) NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_party_type (type)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS sales (id VARCHAR(96) PRIMARY KEY, invoice_no VARCHAR(64) NOT NULL UNIQUE, branch_id VARCHAR(96) NOT NULL, customer_id VARCHAR(96) NULL, user_id VARCHAR(96) NOT NULL, subtotal DECIMAL(14,2) NOT NULL, discount DECIMAL(14,2) NOT NULL DEFAULT 0, total DECIMAL(14,2) NOT NULL, paid_amount DECIMAL(14,2) NOT NULL DEFAULT 0, balance_due DECIMAL(14,2) NOT NULL DEFAULT 0, payment_type VARCHAR(20) NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'completed', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_sale_branch_time (branch_id, created_at)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS sale_items (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, sale_id VARCHAR(96) NOT NULL, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, batch_no VARCHAR(96) NOT NULL, quantity INT NOT NULL, unit_price DECIMAL(14,2) NOT NULL, returned_quantity INT NOT NULL DEFAULT 0, INDEX idx_sale_item_sale (sale_id)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS purchases (id VARCHAR(96) PRIMARY KEY, branch_id VARCHAR(96) NOT NULL, supplier_id VARCHAR(96) NOT NULL, user_id VARCHAR(96) NOT NULL, subtotal DECIMAL(14,2) NOT NULL, paid_amount DECIMAL(14,2) NOT NULL DEFAULT 0, balance_due DECIMAL(14,2) NOT NULL DEFAULT 0, status VARCHAR(30) NOT NULL DEFAULT 'pending', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_purchase_branch_time (branch_id, created_at)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS purchase_items (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, purchase_id VARCHAR(96) NOT NULL, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, batch_no VARCHAR(96) NOT NULL, expiry_date DATE NOT NULL, quantity INT NOT NULL, purchase_price DECIMAL(14,2) NOT NULL, sale_price DECIMAL(14,2) NOT NULL, INDEX idx_purchase_item_purchase (purchase_id)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS khata_entries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, party_id VARCHAR(96) NOT NULL, entry_type VARCHAR(40) NOT NULL, debit DECIMAL(14,2) NOT NULL DEFAULT 0, credit DECIMAL(14,2) NOT NULL DEFAULT 0, reference_id VARCHAR(96) NULL, note VARCHAR(400) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_khata_party (party_id)) ENGINE=InnoDB");
+  }
+  private async loadSale(tenantPool: any, saleId: string): Promise<SaleRecord | undefined> {
+    const rows = await tenantPool.query("SELECT id, invoice_no AS invoiceNo, branch_id AS branchId, customer_id AS customerId, subtotal, discount, total, paid_amount AS paidAmount, balance_due AS balanceDue, payment_type AS paymentType, status, created_at AS createdAt FROM sales WHERE id = ? LIMIT 1", [saleId]) as any[];
+    const row = rows[0]; if (!row) return undefined;
+    const items = await tenantPool.query("SELECT medicine_id AS medicineId, batch_id AS batchId, batch_no AS batchNo, quantity, unit_price AS unitPrice, returned_quantity AS returnedQuantity FROM sale_items WHERE sale_id = ? ORDER BY id", [saleId]) as any[];
+    return { id: row.id, invoiceNo: row.invoiceNo, branchId: row.branchId, customerId: row.customerId, subtotal: Number(row.subtotal), discount: Number(row.discount), total: Number(row.total), paidAmount: Number(row.paidAmount), balanceDue: Number(row.balanceDue), paymentType: row.paymentType, status: row.status, items: items.map((i: any) => ({ medicineId: i.medicineId, batchId: i.batchId, batchNo: i.batchNo, quantity: Number(i.quantity), unitPrice: Number(i.unitPrice), returnedQuantity: Number(i.returnedQuantity) })), createdAt: String(row.createdAt) };
+  }
+  private async loadPurchase(tenantPool: any, purchaseId: string): Promise<PurchaseRecord | undefined> {
+    const rows = await tenantPool.query("SELECT id, branch_id AS branchId, supplier_id AS supplierId, subtotal, paid_amount AS paidAmount, balance_due AS balanceDue, status, created_at AS createdAt FROM purchases WHERE id = ? LIMIT 1", [purchaseId]) as any[];
+    const row = rows[0]; if (!row) return undefined;
+    const items = await tenantPool.query("SELECT medicine_id AS medicineId, batch_id AS batchId, batch_no AS batchNo, expiry_date AS expiryDate, quantity, purchase_price AS purchasePrice, sale_price AS salePrice FROM purchase_items WHERE purchase_id = ? ORDER BY id", [purchaseId]) as any[];
+    return { id: row.id, branchId: row.branchId, supplierId: row.supplierId, subtotal: Number(row.subtotal), paidAmount: Number(row.paidAmount), balanceDue: Number(row.balanceDue), status: row.status, items: items.map((i: any) => ({ medicineId: i.medicineId, batchId: i.batchId, batchNo: i.batchNo, expiryDate: String(i.expiryDate).slice(0, 10), quantity: Number(i.quantity), purchasePrice: Number(i.purchasePrice), salePrice: Number(i.salePrice) })), createdAt: String(row.createdAt) };
+  }
+  private async partyBalanceFromPool(tenantPool: any, partyId: string, partyType: string) {
+    const rows = await tenantPool.query("SELECT debit, credit FROM khata_entries WHERE party_id = ?", [partyId]) as any[];
+    return rows.reduce((sum: number, r: any) => sum + (partyType === "supplier" ? (Number(r.credit) - Number(r.debit)) : (Number(r.debit) - Number(r.credit))), 0);
+  }
+  async createParty(tenantId: string, input: { type: "customer" | "supplier"; name: string; phone?: string | null; address?: string | null }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const id = randomId("party");
+    await tenantPool.query("INSERT INTO parties (id, type, name, phone, address, active) VALUES (?, ?, ?, ?, ?, TRUE)", [id, input.type, input.name, input.phone ?? null, input.address ?? null]);
+    return { id, type: input.type, name: input.name, phone: input.phone ?? null, address: input.address ?? null, active: true };
+  }
+  async listParties(tenantId: string, type?: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const rows = type ? await tenantPool.query("SELECT id, type, name, phone, address, active FROM parties WHERE type = ? ORDER BY name", [type]) as any[] : await tenantPool.query("SELECT id, type, name, phone, address, active FROM parties ORDER BY name") as any[];
+    return rows.map((r: any) => ({ id: r.id, type: r.type, name: r.name, phone: r.phone, address: r.address, active: Boolean(r.active) }));
+  }
+  async getPartyBalance(tenantId: string, partyId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id, type, name, phone, address, active FROM parties WHERE id = ? LIMIT 1", [partyId]) as any[];
+    const row = rows[0]; if (!row) throw new Error("PARTY_NOT_FOUND");
+    const party: PartyRecord = { id: row.id, type: row.type, name: row.name, phone: row.phone, address: row.address, active: Boolean(row.active) };
+    const entries = await tenantPool.query("SELECT id, party_id AS partyId, entry_type AS entryType, debit, credit, reference_id AS referenceId, note, created_at AS createdAt FROM khata_entries WHERE party_id = ? ORDER BY id", [partyId]) as any[];
+    return { party, balance: await this.partyBalanceFromPool(tenantPool, partyId, party.type), entries: entries.map((e: any) => ({ id: String(e.id), partyId: e.partyId, entryType: e.entryType, debit: Number(e.debit), credit: Number(e.credit), referenceId: e.referenceId, note: e.note, createdAt: String(e.createdAt) })) };
+  }
+  async payParty(tenantId: string, _userId: string, input: { partyId: string; amount: number; note?: string | null }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT type FROM parties WHERE id = ? LIMIT 1", [input.partyId]) as any[];
+    if (!rows.length) throw new Error("PARTY_NOT_FOUND");
+    if (!(input.amount > 0)) throw new Error("INVALID_AMOUNT");
+    const isSupplier = rows[0].type === "supplier";
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const result = await connection.query("INSERT INTO khata_entries (party_id, entry_type, debit, credit, reference_id, note) VALUES (?, 'payment', ?, ?, NULL, ?)", [input.partyId, isSupplier ? input.amount : 0, isSupplier ? 0 : input.amount, input.note ?? null]) as { insertId?: number };
+      // FIFO allocation, same rule as memory: sale/purchase balances stay in sync with khata.
+      let remaining = input.amount;
+      if (!isSupplier) {
+        const openSales = await connection.query("SELECT id, balance_due AS balanceDue FROM sales WHERE customer_id = ? AND balance_due > 0 ORDER BY created_at ASC FOR UPDATE", [input.partyId]) as any[];
+        for (const sale of openSales) {
+          if (remaining <= 0) break;
+          const take = Math.min(remaining, Number(sale.balanceDue));
+          await connection.query("UPDATE sales SET balance_due = balance_due - ? WHERE id = ?", [take, sale.id]);
+          remaining -= take;
+        }
+      } else {
+        const openPurchases = await connection.query("SELECT id, balance_due AS balanceDue FROM purchases WHERE supplier_id = ? AND balance_due > 0 ORDER BY created_at ASC FOR UPDATE", [input.partyId]) as any[];
+        for (const pur of openPurchases) {
+          if (remaining <= 0) break;
+          const take = Math.min(remaining, Number(pur.balanceDue));
+          await connection.query("UPDATE purchases SET balance_due = balance_due - ? WHERE id = ?", [take, pur.id]);
+          remaining -= take;
+        }
+      }
+      await connection.commit();
+      return { id: String(result.insertId ?? ""), partyId: input.partyId, entryType: "payment", debit: isSupplier ? input.amount : 0, credit: isSupplier ? 0 : input.amount, referenceId: null, note: input.note ?? null, createdAt: new Date().toISOString() };
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    if (input.paymentType === "credit" && !input.customerId) throw new Error("CUSTOMER_REQUIRED");
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      if (input.customerId) {
+        const cust = await connection.query("SELECT type FROM parties WHERE id = ? LIMIT 1", [input.customerId]) as any[];
+        if (!cust.length || cust[0].type !== "customer") throw new Error("PARTY_NOT_FOUND");
+      }
+      const allocations: Array<{ medicineId: string; batchId: string; batchNo: string; quantity: number; unitPrice: number }> = [];
+      for (const item of input.items) {
+        const med = await connection.query("SELECT active FROM medicines WHERE id = ? LIMIT 1", [item.medicineId]) as any[];
+        if (!med.length || !med[0].active) throw new Error("MEDICINE_NOT_FOUND");
+        if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+        let remaining = item.quantity;
+        const candidates = await connection.query("SELECT b.id, b.batch_no AS batchNo, b.sale_price AS salePrice, bs.quantity FROM medicine_batches b JOIN branch_stock bs ON bs.batch_id = b.id WHERE b.medicine_id = ? AND bs.branch_id = ? AND bs.quantity > 0 AND b.expiry_date >= CURDATE() ORDER BY b.expiry_date FOR UPDATE", [item.medicineId, input.branchId]) as any[];
+        for (const c of candidates) {
+          if (remaining <= 0) break;
+          const take = Math.min(remaining, Number(c.quantity));
+          allocations.push({ medicineId: item.medicineId, batchId: c.id, batchNo: c.batchNo, quantity: take, unitPrice: Number(c.salePrice) });
+          remaining -= take;
+        }
+        if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+      }
+      const subtotal = allocations.reduce((sum, a) => sum + a.quantity * a.unitPrice, 0);
+      if (input.discount < 0 || input.discount > subtotal) throw new Error("INVALID_DISCOUNT");
+      const total = subtotal - input.discount;
+      if (input.paidAmount < 0 || input.paidAmount > total) throw new Error("PAYMENT_MISMATCH");
+      if (input.paymentType === "cash" && input.paidAmount !== total) throw new Error("PAYMENT_MISMATCH");
+      const balanceDue = total - input.paidAmount;
+      const saleId = randomId("sale");
+      const countRows = await connection.query("SELECT COUNT(*) AS n FROM sales") as any[];
+      let invoiceNo = "INV-" + String(Number(countRows[0].n) + 1).padStart(6, "0");
+      try {
+        await connection.query("INSERT INTO sales (id, invoice_no, branch_id, customer_id, user_id, subtotal, discount, total, paid_amount, balance_due, payment_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')", [saleId, invoiceNo, input.branchId, input.customerId ?? null, userId, subtotal, input.discount, total, input.paidAmount, balanceDue, input.paymentType]);
+      } catch (e: any) {
+        if (String(e?.code) === "ER_DUP_ENTRY") {
+          invoiceNo = "INV-" + String(Number(countRows[0].n) + 1).padStart(6, "0") + "-" + Math.floor(Math.random() * 9000 + 1000);
+          await connection.query("INSERT INTO sales (id, invoice_no, branch_id, customer_id, user_id, subtotal, discount, total, paid_amount, balance_due, payment_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')", [saleId, invoiceNo, input.branchId, input.customerId ?? null, userId, subtotal, input.discount, total, input.paidAmount, balanceDue, input.paymentType]);
+        } else throw e;
+      }
+      for (const a of allocations) {
+        await connection.query("INSERT INTO sale_items (sale_id, medicine_id, batch_id, batch_no, quantity, unit_price, returned_quantity) VALUES (?, ?, ?, ?, ?, ?, 0)", [saleId, a.medicineId, a.batchId, a.batchNo, a.quantity, a.unitPrice]);
+        await connection.query("UPDATE branch_stock SET quantity = quantity - ? WHERE branch_id = ? AND batch_id = ?", [a.quantity, input.branchId, a.batchId]);
+        await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'sale', ?, ?, ?, 0, ?)", [randomId("movement"), input.branchId, a.batchId, -a.quantity, saleId, `sale-${saleId}-${a.batchId}`, userId]);
+      }
+      if (balanceDue > 0 && input.customerId) await connection.query("INSERT INTO khata_entries (party_id, entry_type, debit, credit, reference_id, note) VALUES (?, 'sale_credit', ?, 0, ?, ?)", [input.customerId, balanceDue, saleId, `Sale ${invoiceNo} credit`]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'sale.create', 'sale', ?, ?)", [userId, saleId, JSON.stringify({ invoiceNo, total })]);
+      await connection.commit();
+      return { id: saleId, invoiceNo, branchId: input.branchId, customerId: input.customerId ?? null, subtotal, discount: input.discount, total, paidAmount: input.paidAmount, balanceDue, paymentType: input.paymentType, status: "completed" as const, items: allocations.map((a) => ({ ...a, returnedQuantity: 0 })), createdAt: new Date().toISOString() };
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async getSale(tenantId: string, saleId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    return this.loadSale(tenantPool, saleId);
+  }
+  async listSales(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id FROM sales ORDER BY created_at DESC LIMIT 200") as any[];
+    const out: SaleRecord[] = [];
+    for (const r of rows) { const sale = await this.loadSale(tenantPool, r.id); if (sale) out.push(sale); }
+    return out;
+  }
+  async returnSale(tenantId: string, userId: string, saleId: string, items: Array<{ medicineId: string; batchId: string; quantity: number }>) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const sale = await this.loadSale(connection, saleId);
+      if (!sale) throw new Error("SALE_NOT_FOUND");
+      if (sale.status === "returned") throw new Error("ALREADY_RETURNED");
+      let refund = 0;
+      for (const item of items) {
+        const line = sale.items.find((i) => i.medicineId === item.medicineId && i.batchId === item.batchId);
+        if (!line) throw new Error("RETURN_ITEM_NOT_FOUND");
+        if (!(item.quantity > 0) || item.quantity > line.quantity - line.returnedQuantity) throw new Error("RETURN_EXCEEDS_SOLD");
+        const discountRatio = sale.subtotal > 0 ? sale.discount / sale.subtotal : 0;
+        refund += item.quantity * line.unitPrice * (1 - discountRatio);
+      }
+      refund = Math.round(refund * 100) / 100;
+      for (const item of items) {
+        const line = sale.items.find((i) => i.medicineId === item.medicineId && i.batchId === item.batchId)!;
+        await connection.query("UPDATE sale_items SET returned_quantity = returned_quantity + ? WHERE sale_id = ? AND medicine_id = ? AND batch_id = ?", [item.quantity, saleId, item.medicineId, item.batchId]);
+        await connection.query("INSERT INTO branch_stock (branch_id, batch_id, quantity, reserved_quantity, reorder_level) VALUES (?, ?, ?, 0, 0) ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)", [sale.branchId, item.batchId, item.quantity]);
+        await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'return', ?, ?, ?, 0, ?)", [randomId("movement"), sale.branchId, item.batchId, item.quantity, saleId, `return-${saleId}-${item.batchId}-${line.returnedQuantity + item.quantity}`, userId]);
+        line.returnedQuantity += item.quantity;
+      }
+      let creditApplied = 0;
+      if (sale.customerId && refund > 0) {
+        const partyRows = await connection.query("SELECT type FROM parties WHERE id = ? LIMIT 1", [sale.customerId]) as any[];
+        if (partyRows.length) {
+          const balance = await this.partyBalanceFromPool(connection, sale.customerId, partyRows[0].type);
+          creditApplied = Math.min(refund, Math.max(0, balance));
+          if (creditApplied > 0) await connection.query("INSERT INTO khata_entries (party_id, entry_type, debit, credit, reference_id, note) VALUES (?, 'sale_return', 0, ?, ?, ?)", [sale.customerId, creditApplied, saleId, `Return on ${sale.invoiceNo}`]);
+        }
+      }
+      const newBalance = Math.max(0, sale.balanceDue - creditApplied);
+      const newStatus = sale.items.every((i) => i.returnedQuantity >= i.quantity) ? "returned" : "partially_returned";
+      await connection.query("UPDATE sales SET balance_due = ?, status = ? WHERE id = ?", [newBalance, newStatus, saleId]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'sale.return', 'sale', ?, ?)", [userId, saleId, JSON.stringify({ refund, creditApplied })]);
+      await connection.commit();
+      const updated = await this.loadSale(tenantPool, saleId);
+      return updated!;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  private async applyPurchaseInTransaction(connection: any, tenantPool: any, userId: string, purchase: PurchaseRecord) {
+    for (const item of purchase.items) {
+      const existing = await connection.query("SELECT id, sale_price AS salePrice FROM medicine_batches WHERE medicine_id = ? AND batch_no = ? LIMIT 1", [item.medicineId, item.batchNo]) as any[];
+      let batchId = existing[0]?.id;
+      if (!batchId) {
+        batchId = randomId("batch");
+        await connection.query("INSERT INTO medicine_batches (id, medicine_id, batch_no, expiry_date, purchase_price, sale_price) VALUES (?, ?, ?, ?, ?, ?)", [batchId, item.medicineId, item.batchNo, item.expiryDate, item.purchasePrice, item.salePrice]);
+      }
+      item.batchId = batchId;
+      await connection.query("INSERT INTO branch_stock (branch_id, batch_id, quantity, reserved_quantity, reorder_level) VALUES (?, ?, ?, 0, 0) ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)", [purchase.branchId, batchId, item.quantity]);
+      await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'purchase', ?, ?, ?, 0, ?)", [randomId("movement"), purchase.branchId, batchId, item.quantity, purchase.id, `purchase-${purchase.id}-${batchId}`, userId]);
+      await connection.query("UPDATE purchase_items SET batch_id = ? WHERE purchase_id = ? AND medicine_id = ? AND batch_no = ?", [batchId, purchase.id, item.medicineId, item.batchNo]);
+    }
+    if (purchase.balanceDue > 0) await connection.query("INSERT INTO khata_entries (party_id, entry_type, debit, credit, reference_id, note) VALUES (?, 'purchase_payable', 0, ?, ?, 'Purchase payable')", [purchase.supplierId, purchase.balanceDue, purchase.id]);
+  }
+  async createPurchase(tenantId: string, userId: string, input: { branchId: string; supplierId: string; items: Array<{ medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number; quantity: number }>; paidAmount: number; approved: boolean }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    const supplier = await tenantPool.query("SELECT type FROM parties WHERE id = ? LIMIT 1", [input.supplierId]) as any[];
+    if (!supplier.length || supplier[0].type !== "supplier") throw new Error("PARTY_NOT_FOUND");
+    for (const item of input.items) {
+      const med = await tenantPool.query("SELECT id FROM medicines WHERE id = ? LIMIT 1", [item.medicineId]) as any[];
+      if (!med.length) throw new Error("MEDICINE_NOT_FOUND");
+      if (!(item.quantity > 0) || item.purchasePrice < 0 || item.salePrice < 0) throw new Error("INVALID_ITEMS");
+    }
+    const subtotal = input.items.reduce((sum, i) => sum + i.quantity * i.purchasePrice, 0);
+    if (input.paidAmount < 0 || input.paidAmount > subtotal) throw new Error("PAYMENT_MISMATCH");
+    const balanceDue = subtotal - input.paidAmount;
+    const purchaseId = randomId("purchase");
+    const purchase: PurchaseRecord = { id: purchaseId, branchId: input.branchId, supplierId: input.supplierId, subtotal, paidAmount: input.paidAmount, balanceDue, status: input.approved ? "approved" : "pending", items: input.items.map((i) => ({ medicineId: i.medicineId, batchId: "", batchNo: i.batchNo, expiryDate: i.expiryDate, quantity: i.quantity, purchasePrice: i.purchasePrice, salePrice: i.salePrice })), createdAt: new Date().toISOString() };
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query("INSERT INTO purchases (id, branch_id, supplier_id, user_id, subtotal, paid_amount, balance_due, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [purchaseId, input.branchId, input.supplierId, userId, subtotal, input.paidAmount, balanceDue, purchase.status]);
+      for (const item of purchase.items) await connection.query("INSERT INTO purchase_items (purchase_id, medicine_id, batch_id, batch_no, expiry_date, quantity, purchase_price, sale_price) VALUES (?, ?, '', ?, ?, ?, ?, ?)", [purchaseId, item.medicineId, item.batchNo, item.expiryDate, item.quantity, item.purchasePrice, item.salePrice]);
+      if (input.approved) await this.applyPurchaseInTransaction(connection, tenantPool, userId, purchase);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'purchase.create', 'purchase', ?, ?)", [userId, purchaseId, JSON.stringify({ subtotal, status: purchase.status })]);
+      await connection.commit();
+      return purchase;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async listPurchases(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id FROM purchases ORDER BY created_at DESC LIMIT 200") as any[];
+    const out: PurchaseRecord[] = [];
+    for (const r of rows) { const pur = await this.loadPurchase(tenantPool, r.id); if (pur) out.push(pur); }
+    return out;
+  }
+  async approvePurchase(tenantId: string, userId: string, purchaseId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const purchase = await this.loadPurchase(connection, purchaseId);
+      if (!purchase) throw new Error("PURCHASE_NOT_FOUND");
+      if (purchase.status === "approved") throw new Error("ALREADY_APPROVED");
+      await this.applyPurchaseInTransaction(connection, tenantPool, userId, purchase);
+      await connection.query("UPDATE purchases SET status = 'approved' WHERE id = ?", [purchaseId]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'purchase.approve', 'purchase', ?, ?)", [userId, purchaseId, JSON.stringify({ status: "approved" })]);
+      await connection.commit();
+      const updated = await this.loadPurchase(tenantPool, purchaseId);
+      return updated!;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
   }
 }
 
