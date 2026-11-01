@@ -80,6 +80,24 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 2: Inventory core (local, not pushed yet)
+
+- Medicines: POST/GET /api/inventory/medicines, POST /api/inventory/medicines/import
+  (max 200, partial failures in failed[]), POST /api/inventory/medicines/:id/active
+  (deactivate, never hard delete). SKU and barcode unique per tenant.
+- Batches: POST /api/inventory/batches, GET /api/inventory/medicines/:id/batches.
+  Batch number unique per medicine. Expiry date YYYY-MM-DD.
+- Stock: POST /api/inventory/stock/adjust (permission inventory.adjust,
+  branch access enforced, idempotencyKey required). Transaction + row lock
+  in MariaDB, stock never negative, movement + audit log in one transaction.
+  Same idempotency key returns the same movement, stock is not doubled.
+- FEFO: GET /api/inventory/fefo?medicineId=&branchId= returns the earliest
+  non-expired batch with stock for that branch, or 404.
+- Alerts: GET /api/inventory/alerts — low stock (quantity <= reorder level),
+  expiring soon (90 days), expired with stock (do not sell).
+- Frontend: Inventory nav page is now real (search, list, batches, add
+  medicine/batch, adjust stock, alerts). Other nav pages stay Coming soon.
+
 ## Phase 1: tenant provisioning (MariaDB only)
 
 POST /api/master/tenants creates a tenant the safe way:

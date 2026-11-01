@@ -234,6 +234,71 @@ export function buildRouter(store: Store): Router {
     }
   });
 
+  // Phase 2 — Inventory core. Medicines are tenant-wide, stock is per
+  // branch+batch. No hard delete: medicines are deactivated, stock never
+  // goes negative (transaction + row lock in MariaDB), stock movements are
+  // idempotent by x-idempotency-key (or body idempotencyKey).
+  function branchAccess(request: RequestContext, branchId: string): boolean {
+    return request.auth!.branchIds.includes(branchId);
+  }
+  function mapStoreError(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "INVENTORY_ERROR";
+    const map: Record<string, number> = { SKU_ALREADY_EXISTS: 409, BARCODE_ALREADY_EXISTS: 409, BATCH_ALREADY_EXISTS: 409, MEDICINE_NOT_FOUND: 404, BATCH_NOT_FOUND: 404, NEGATIVE_STOCK: 400, TENANT_DATABASE_NOT_FOUND: 503 };
+    const status = map[code] ?? 500;
+    return response.status(status).json({ error: code, message: code === "NEGATIVE_STOCK" ? "Stock cannot go negative." : code === "SKU_ALREADY_EXISTS" ? "This SKU already exists for this tenant." : code === "BARCODE_ALREADY_EXISTS" ? "This barcode already exists for this tenant." : code === "BATCH_ALREADY_EXISTS" ? "This batch number already exists for this medicine." : "Inventory operation failed." });
+  }
+  router.get("/api/inventory/medicines", requirePermission("inventory.view"), async (request: RequestContext, response) => {
+    const search = typeof request.query.search === "string" ? request.query.search : "";
+    return response.json({ medicines: await store.listMedicines(request.auth!.tenantId, search) });
+  });
+  router.post("/api/inventory/medicines", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    const body = z.object({ sku: z.string().min(1).max(96), barcode: z.string().max(128).nullable().optional(), name: z.string().min(1).max(220), genericSalt: z.string().max(220).nullable().optional(), strength: z.string().max(120).nullable().optional(), dosageForm: z.string().max(80).nullable().optional(), category: z.string().max(120).nullable().optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try { return response.status(201).json({ medicine: await store.createMedicine(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapStoreError(error, response); }
+  });
+  router.post("/api/inventory/medicines/import", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    const body = z.object({ items: z.array(z.object({ sku: z.string().min(1).max(96), barcode: z.string().max(128).nullable().optional(), name: z.string().min(1).max(220), genericSalt: z.string().max(220).nullable().optional(), strength: z.string().max(120).nullable().optional(), dosageForm: z.string().max(80).nullable().optional(), category: z.string().max(120).nullable().optional() })).min(1).max(200) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const created: unknown[] = []; const failed: Array<{ sku: string; error: string }> = [];
+    for (const item of body.data.items) {
+      try { created.push(await store.createMedicine(request.auth!.tenantId, request.auth!.sub, item)); } catch (error) { failed.push({ sku: item.sku, error: error instanceof Error ? error.message : "IMPORT_FAILED" }); }
+    }
+    return response.json({ created, failed, createdCount: created.length, failedCount: failed.length });
+  });
+  router.post("/api/inventory/medicines/:id/active", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    const body = z.object({ active: z.boolean() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    const medicine = await store.setMedicineActive(request.auth!.tenantId, request.auth!.sub, String(request.params.id), body.data.active);
+    if (!medicine) return response.status(404).json({ error: "MEDICINE_NOT_FOUND" });
+    return response.json({ medicine });
+  });
+  router.get("/api/inventory/medicines/:id/batches", requirePermission("inventory.view"), async (request: RequestContext, response) => {
+    return response.json({ batches: await store.listBatches(request.auth!.tenantId, String(request.params.id)) });
+  });
+  router.post("/api/inventory/batches", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    const body = z.object({ medicineId: z.string().min(1), batchNo: z.string().min(1).max(96), expiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), purchasePrice: z.number().min(0), salePrice: z.number().min(0) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try { return response.status(201).json({ batch: await store.createBatch(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapStoreError(error, response); }
+  });
+  router.post("/api/inventory/stock/adjust", requirePermission("inventory.adjust"), async (request: RequestContext, response) => {
+    const body = z.object({ branchId: z.string().min(1), batchId: z.string().min(1), quantity: z.number().int().refine((n) => n !== 0), movementType: z.enum(["purchase", "sale", "adjust", "return", "damage", "transfer"]), referenceId: z.string().max(96).nullable().optional(), idempotencyKey: z.string().min(1).max(160).optional(), reorderLevel: z.number().int().min(0).optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED", message: "Your account does not have access to this branch." });
+    const idempotencyKey = body.data.idempotencyKey ?? request.header("x-idempotency-key") ?? "";
+    if (!idempotencyKey) return response.status(400).json({ error: "IDEMPOTENCY_KEY_REQUIRED", message: "Send idempotencyKey (or x-idempotency-key) with every stock adjustment." });
+    try { return response.json({ movement: await store.adjustStock(request.auth!.tenantId, request.auth!.sub, { ...body.data, idempotencyKey }) }); } catch (error) { return mapStoreError(error, response); }
+  });
+  router.get("/api/inventory/alerts", requirePermission("inventory.view"), async (request: RequestContext, response) => response.json(await store.getStockAlerts(request.auth!.tenantId)));
+  router.get("/api/inventory/fefo", requirePermission("inventory.view"), async (request: RequestContext, response) => {
+    const medicineId = typeof request.query.medicineId === "string" ? request.query.medicineId : "";
+    const branchId = typeof request.query.branchId === "string" ? request.query.branchId : "";
+    if (!medicineId || !branchId) return response.status(400).json({ error: "INVALID_INPUT", message: "Pass medicineId and branchId." });
+    if (!branchAccess(request, branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    const batch = await store.getFefoBatch(request.auth!.tenantId, medicineId, branchId);
+    if (!batch) return response.status(404).json({ error: "NO_FEFO_BATCH", message: "No non-expired batch with stock for this branch." });
+    return response.json({ batch });
+  });
+
   // Phase 0 honesty fix: sync health must not return a random cursor, and
   // sync push must not pretend a record was saved when it was not.
   // Cursor-based offline sync storage lands in Phase 6. Until then, clients
