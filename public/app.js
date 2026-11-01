@@ -235,6 +235,7 @@ async function renderReports() {
   document.querySelector('#mainContent').innerHTML =
     '<div class="topbar"><div><div class="eyebrow">REPORTS & TRANSFERS — ADVANCED ONLY</div><h1 class="headline">Reports & branch transfers</h1><p class="subhead">Reports Phase 3 ki sales, purchases aur stock se hi bante hain, is liye report ka total dashboard aur sales list se match karna chahiye. Basic plan par ye page server se block hai.</p></div></div>' +
     '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">Sales report</h2></div><div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><input id="repFrom" type="date" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input id="repTo" type="date" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select id="repBranch" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="">All branches</option>' + branches + '</select><button class="btn primary" id="repLoad">Load report</button><button class="btn" id="repCsv">Export CSV</button></div><div id="repResult"><p>Load a report to see real totals.</p></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Accounting</h2></div><div id="accResult"><p>Loading...</p></div></section>' +
     '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Branch transfer</h2></div><form id="transferForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="medicineId" placeholder="Medicine ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="batchId" placeholder="Batch ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select name="fromBranchId" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><select name="toBranchId" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><input name="quantity" type="number" step="1" min="1" placeholder="Qty *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Request transfer</button></form><p style="font-size:12px;color:#627d98">Request par stock nahi hilta. Approve par source branch se stock kam aur destination par zyada hota hai, aik transaction me. Reject par kuch nahi hota.</p><div id="transferList" style="margin-top:12px"><p>Loading...</p></div></section>';
   async function loadReport() {
     const from = document.querySelector('#repFrom').value; const to = document.querySelector('#repTo').value; const branchId = document.querySelector('#repBranch').value;
@@ -260,6 +261,15 @@ async function renderReports() {
       const a = document.createElement('a'); a.href = url; a.download = 'sales-report.csv'; a.click(); URL.revokeObjectURL(url);
     } catch (e) { alert(e.message); }
   });
+  async function loadAccounting() {
+    try {
+      const data = await api('/api/accounting/summary');
+      const a = data.accounting; const box = document.querySelector('#accResult'); if (!box) return;
+      box.innerHTML = '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px"><div><strong>Revenue</strong><div>' + money(a.revenue) + '</div></div><div><strong>Purchases</strong><div>' + money(a.purchases) + '</div></div><div><strong>Profit</strong><div>' + money(a.profit) + '</div></div><div><strong>Receivable (customers owe)</strong><div>' + money(a.receivable) + '</div></div><div><strong>Payable (we owe suppliers)</strong><div>' + money(a.payable) + '</div></div><div><strong>Cash received on sales</strong><div>' + money(a.cashReceived) + '</div></div></div>' +
+        '<h3>Ledger (derived, not a separate copy)</h3><p style="font-size:12px;color:#627d98">Ledger sales, purchases aur khata payments se har dafa banaya jata hai, is liye ye kabhi menus se alag nahi ho sakta.</p>' +
+        a.ledger.slice(0, 50).map(e => '<div class="activity"><div><strong>' + e.type + ' - ' + e.reference + '</strong><span>' + e.note + ' - Debit ' + e.debit + ' - Credit ' + e.credit + '</span></div><time>' + e.date.slice(0, 10) + '</time></div>').join('');
+    } catch (e) { const box = document.querySelector('#accResult'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
   async function loadTransfers() {
     try {
       const data = await api('/api/transfers');
@@ -270,7 +280,7 @@ async function renderReports() {
       box.querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/transfers/' + btn.dataset.reject + '/reject', { method: 'POST', body: JSON.stringify({}) }); loadTransfers(); } catch (err) { alert(err.message); } }));
     } catch (e) { const box = document.querySelector('#transferList'); if (box) box.innerHTML = '<p class="error">' + e.message + '</p>'; }
   }
-  loadTransfers();
+  loadTransfers(); loadAccounting();
   document.querySelector('#transferForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); f.quantity = Number(f.quantity); try { await api('/api/transfers', { method: 'POST', body: JSON.stringify(f) }); loadTransfers(); } catch (err) { alert(err.message); } });
   loadReport();
 }

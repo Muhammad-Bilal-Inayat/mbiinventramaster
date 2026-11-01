@@ -420,6 +420,16 @@ export function buildRouter(store: Store): Router {
     try { return response.json({ transfer: await store.rejectTransfer(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase4Error(error, response); }
   });
 
+  // Phase 4 slice 2 — Accounting, Advanced only. No separate stored ledger:
+  // the summary and ledger are derived from Phase 3 sales, purchases and
+  // khata entries every time, so accounting can never drift from the menus.
+  router.get("/api/accounting/summary", requirePermission("accounting.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const filters = { from: typeof request.query.from === "string" ? request.query.from : undefined, to: typeof request.query.to === "string" ? request.query.to : undefined, branchId: typeof request.query.branchId === "string" ? request.query.branchId : undefined };
+    if (filters.branchId && !branchAccess(request, filters.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    return response.json({ accounting: await store.getAccounting(request.auth!.tenantId, filters) });
+  });
+
   // Phase 0 honesty fix: sync health must not return a random cursor, and
   // sync push must not pretend a record was saved when it was not.
   // Cursor-based offline sync storage lands in Phase 6. Until then, clients

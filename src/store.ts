@@ -120,6 +120,16 @@ export interface SalesReport {
   sales: SaleRecord[];
 }
 
+export interface AccountingSummary {
+  revenue: number;
+  purchases: number;
+  profit: number;
+  receivable: number;
+  payable: number;
+  cashReceived: number;
+  ledger: Array<{ date: string; type: string; reference: string; debit: number; credit: number; note: string }>;
+}
+
 export interface TransferRecord {
   id: string;
   medicineId: string;
@@ -222,6 +232,7 @@ export interface Store {
   listTransfers(tenantId: string): Promise<TransferRecord[]>;
   approveTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
   rejectTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
+  getAccounting(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<AccountingSummary>;
 }
 
 const ownerPermissions: PermissionCode[] = [
@@ -698,6 +709,48 @@ class MemoryStore implements Store {
     if (transfer.status !== "pending") throw new Error("TRANSFER_NOT_PENDING");
     transfer.status = "rejected";
     const { tenantId: _t, ...rest } = transfer; return rest;
+  }
+  async getAccounting(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<AccountingSummary> {
+    const inRange = (createdAt: string) => {
+      const d = createdAt.slice(0, 10);
+      if (filters.from && d < filters.from) return false;
+      if (filters.to && d > filters.to) return false;
+      return true;
+    };
+    const sales = [...this.sales.values()].filter((x) => x.tenantId === tenantId && inRange(x.createdAt) && (!filters.branchId || x.branchId === filters.branchId));
+    const purchases = [...this.purchases.values()].filter((x) => x.tenantId === tenantId && x.status === "approved" && inRange(x.createdAt) && (!filters.branchId || x.branchId === filters.branchId));
+    const revenue = sales.reduce((sum, x) => sum + x.total, 0);
+    const purchaseTotal = purchases.reduce((sum, x) => sum + x.subtotal, 0);
+    const cost = sales.flatMap((x) => x.items).reduce((sum, i) => sum + i.quantity * (this.batches.get(i.batchId)?.purchasePrice ?? 0), 0);
+    let receivable = 0; let payable = 0;
+    for (const party of this.parties.values()) {
+      if (party.tenantId !== tenantId) continue;
+      const balance = this.partyBalance(tenantId, party);
+      if (party.type === "customer" && balance > 0) receivable += balance;
+      if (party.type === "supplier" && balance > 0) payable += balance;
+    }
+    const cashReceived = sales.reduce((sum, x) => sum + x.paidAmount, 0);
+    const ledger: AccountingSummary["ledger"] = [];
+    for (const sale of sales) {
+      ledger.push({ date: sale.createdAt, type: "sale", reference: sale.invoiceNo, debit: sale.paidAmount, credit: 0, note: `Sale ${sale.invoiceNo} cash received` });
+      if (sale.balanceDue > 0) ledger.push({ date: sale.createdAt, type: "sale_credit", reference: sale.invoiceNo, debit: sale.balanceDue, credit: 0, note: `Sale ${sale.invoiceNo} receivable` });
+      ledger.push({ date: sale.createdAt, type: "sale_revenue", reference: sale.invoiceNo, debit: 0, credit: sale.total, note: `Sale ${sale.invoiceNo} revenue` });
+    }
+    for (const pur of purchases) {
+      ledger.push({ date: pur.createdAt, type: "purchase", reference: pur.id, debit: pur.subtotal, credit: 0, note: "Purchase stock" });
+      if (pur.paidAmount > 0) ledger.push({ date: pur.createdAt, type: "purchase_payment", reference: pur.id, debit: 0, credit: pur.paidAmount, note: "Purchase cash paid" });
+      if (pur.balanceDue > 0) ledger.push({ date: pur.createdAt, type: "purchase_payable", reference: pur.id, debit: 0, credit: pur.balanceDue, note: "Purchase payable" });
+    }
+    for (const entry of this.khata) {
+      const party = this.parties.get(entry.partyId);
+      if (!party || party.tenantId !== tenantId) continue;
+      if (entry.entryType !== "payment") continue;
+      const amount = entry.debit + entry.credit;
+      if (party.type === "customer") { ledger.push({ date: entry.createdAt, type: "khata_payment", reference: entry.partyId, debit: amount, credit: 0, note: "Customer khata payment received (cash)" }); ledger.push({ date: entry.createdAt, type: "khata_payment", reference: entry.partyId, debit: 0, credit: amount, note: "Customer khata payment received (receivable)" }); }
+      else { ledger.push({ date: entry.createdAt, type: "khata_payment", reference: entry.partyId, debit: amount, credit: 0, note: "Supplier khata payment made (payable)" }); ledger.push({ date: entry.createdAt, type: "khata_payment", reference: entry.partyId, debit: 0, credit: amount, note: "Supplier khata payment made (cash)" }); }
+    }
+    ledger.sort((a, b) => a.date.localeCompare(b.date));
+    return { revenue, purchases: purchaseTotal, profit: revenue - cost, receivable, payable, cashReceived, ledger: ledger.slice(0, 200) };
   }
 }
 
@@ -1281,6 +1334,48 @@ class MariaDbHealthStore implements Store {
     await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'transfer.reject', 'transfer', ?, ?)", [userId, transferId, JSON.stringify({ status: "rejected" })]);
     const updated = await this.loadTransfer(tenantPool, transferId);
     return updated!;
+  }
+  async getAccounting(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<AccountingSummary> {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filters.from) { where.push("DATE(created_at) >= ?"); params.push(filters.from); }
+    if (filters.to) { where.push("DATE(created_at) <= ?"); params.push(filters.to); }
+    if (filters.branchId) { where.push("branch_id = ?"); params.push(filters.branchId); }
+    const clause = where.length ? " WHERE " + where.join(" AND ") : "";
+    const salesRows = await tenantPool.query(`SELECT COALESCE(SUM(total), 0) AS revenue, COALESCE(SUM(paid_amount), 0) AS cashReceived FROM sales${clause}`, params) as any[];
+    const purClause = where.length ? clause + " AND status = 'approved'" : " WHERE status = 'approved'";
+    const purRows = await tenantPool.query(`SELECT COALESCE(SUM(subtotal), 0) AS purchases FROM purchases${purClause}`, params) as any[];
+    const costRows = await tenantPool.query("SELECT COALESCE(SUM(si.quantity * b.purchase_price), 0) AS cost FROM sale_items si JOIN medicine_batches b ON b.id = si.batch_id JOIN sales s ON s.id = si.sale_id" + (where.length ? " WHERE " + where.map((w) => w.replace("created_at", "s.created_at").replace("branch_id", "s.branch_id")).join(" AND ") : ""), params) as any[];
+    const parties = await tenantPool.query("SELECT id, type FROM parties") as any[];
+    let receivable = 0; let payable = 0;
+    for (const party of parties) {
+      const balance = await this.partyBalanceFromPool(tenantPool, party.id, party.type);
+      if (party.type === "customer" && balance > 0) receivable += balance;
+      if (party.type === "supplier" && balance > 0) payable += balance;
+    }
+    const sales = await tenantPool.query(`SELECT invoice_no AS invoiceNo, total, paid_amount AS paidAmount, balance_due AS balanceDue, created_at AS createdAt FROM sales${clause} ORDER BY created_at ASC LIMIT 200`, params) as any[];
+    const purchases = await tenantPool.query(`SELECT id, subtotal, paid_amount AS paidAmount, balance_due AS balanceDue, created_at AS createdAt FROM purchases${purClause} ORDER BY created_at ASC LIMIT 200`, params) as any[];
+    const ledger: AccountingSummary["ledger"] = [];
+    for (const sale of sales) {
+      ledger.push({ date: String(sale.createdAt), type: "sale", reference: sale.invoiceNo, debit: Number(sale.paidAmount), credit: 0, note: `Sale ${sale.invoiceNo} cash received` });
+      if (Number(sale.balanceDue) > 0) ledger.push({ date: String(sale.createdAt), type: "sale_credit", reference: sale.invoiceNo, debit: Number(sale.balanceDue), credit: 0, note: `Sale ${sale.invoiceNo} receivable` });
+      ledger.push({ date: String(sale.createdAt), type: "sale_revenue", reference: sale.invoiceNo, debit: 0, credit: Number(sale.total), note: `Sale ${sale.invoiceNo} revenue` });
+    }
+    for (const pur of purchases) {
+      ledger.push({ date: String(pur.createdAt), type: "purchase", reference: pur.id, debit: Number(pur.subtotal), credit: 0, note: "Purchase stock" });
+      if (Number(pur.paidAmount) > 0) ledger.push({ date: String(pur.createdAt), type: "purchase_payment", reference: pur.id, debit: 0, credit: Number(pur.paidAmount), note: "Purchase cash paid" });
+      if (Number(pur.balanceDue) > 0) ledger.push({ date: String(pur.createdAt), type: "purchase_payable", reference: pur.id, debit: 0, credit: Number(pur.balanceDue), note: "Purchase payable" });
+    }
+    const khataRows = await tenantPool.query("SELECT k.party_id AS partyId, k.debit, k.credit, k.created_at AS createdAt, p.type AS partyType FROM khata_entries k JOIN parties p ON p.id = k.party_id WHERE k.entry_type = 'payment' ORDER BY k.created_at ASC LIMIT 200") as any[];
+    for (const entry of khataRows) {
+      const amount = Number(entry.debit) + Number(entry.credit);
+      if (entry.partyType === "customer") { ledger.push({ date: String(entry.createdAt), type: "khata_payment", reference: entry.partyId, debit: amount, credit: 0, note: "Customer khata payment received (cash)" }); ledger.push({ date: String(entry.createdAt), type: "khata_payment", reference: entry.partyId, debit: 0, credit: amount, note: "Customer khata payment received (receivable)" }); }
+      else { ledger.push({ date: String(entry.createdAt), type: "khata_payment", reference: entry.partyId, debit: amount, credit: 0, note: "Supplier khata payment made (payable)" }); ledger.push({ date: String(entry.createdAt), type: "khata_payment", reference: entry.partyId, debit: 0, credit: amount, note: "Supplier khata payment made (cash)" }); }
+    }
+    ledger.sort((a, b) => a.date.localeCompare(b.date));
+    return { revenue: Number(salesRows[0]?.revenue ?? 0), purchases: Number(purRows[0]?.purchases ?? 0), profit: Number(salesRows[0]?.revenue ?? 0) - Number(costRows[0]?.cost ?? 0), receivable, payable, cashReceived: Number(salesRows[0]?.cashReceived ?? 0), ledger: ledger.slice(0, 200) };
   }
 }
 

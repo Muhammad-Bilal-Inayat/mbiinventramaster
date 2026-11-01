@@ -80,6 +80,27 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 4 slice 2: Accounting (local, not pushed yet)
+
+Advanced only, same rule as slice 1. No separate stored ledger table:
+the summary and ledger are derived from Phase 3 sales, purchases and
+khata entries every time, so accounting can never drift from the menus.
+- GET /api/accounting/summary (accounting.view, Advanced gate, optional
+  ?from=&to=&branchId=): revenue, approved purchases, profit (sales minus
+  batch purchase cost), receivable (positive customer khata balances),
+  payable (positive supplier khata balances), cash received on sales,
+  plus a ledger (sale cash/revenue, sale credit, purchase stock/payment/
+  payable, khata payments, newest 200, chronological).
+- Honest limit: this is a derived summary + ledger, not an immutable
+  journal. A sale whose balance was later paid or returned shows its
+  CURRENT balance in the ledger, not its original credit at sale time.
+  A stored, immutable journal at transaction time is a future accounting
+  step, not claimed here.
+- Frontend: Accounting panel inside the Reports page (summary cards +
+  ledger table). No new nav item, no new migration file (derived only).
+- Remaining Phase 4 modules NOT built yet: prescriptions, controlled
+  drugs, online store, staff attendance/payroll.
+
 ## Phase 4 slice 1: Reports/Export + Branch Transfer (pushed, commit c1cdd5a)
 
 Phase 4 is 7 modules, so it is built in slices, not all at once — this slice
