@@ -9,6 +9,14 @@ import pino from "pino";
 import { buildRouter } from "./routes.js";
 import { createStore } from "./store.js";
 
+// NexPanel quirk (2026-10-17): panel env lines written as "KEY = value"
+// arrive with spaces. Trim the database connection values at boot so a
+// spaced value can never point the app at a wrong database. Passwords are
+// never trimmed: they are opaque.
+for (const key of ["MARIADB_HOST", "MARIADB_PORT", "MARIADB_USER", "MARIADB_DATABASE", "TENANT_DB_PREFIX"]) {
+  if (process.env[key] !== undefined) process.env[key] = process.env[key].trim();
+}
+
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const port = Number(process.env.PORT || 3000);
 const app = express();

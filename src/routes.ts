@@ -2,7 +2,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { z } from "zod";
 import { allPermissionCodes, plans } from "./catalog.js";
 import { signAccessToken, verifyAccessToken, verifyPassword, type AccessClaims, deviceFingerprint } from "./security.js";
-import { provisionTenant } from "./provision.js";
+import { provisionTenant, probeDatabaseCreation } from "./provision.js";
 import { masterRegistry, isLicenseBlocked } from "./master.js";
 import { pushSyncRecords } from "./sync.js";
 import { chatWithGroq } from "./ai.js";
@@ -101,9 +101,15 @@ export function buildRouter(store: Store): Router {
     if (!matchingDevice && activeDevices.length >= deviceLimit) {
       return response.status(409).json({ error: "DEVICE_LIMIT_REACHED", limit: deviceLimit, message: "This tenant already has the maximum number of active devices. Revoke an old device first." });
     }
-    const device = matchingDevice || await store.registerDevice({ tenantId: tenant.id, userId: user.id, name: body.data.deviceName, hwidHash });
-    const token = signAccessToken({ sub: user.id, tenantId: tenant.id, deviceId: device.id, plan: tenant.plan, branchIds: user.branchIds, permissions: user.permissions });
-    response.json({ token, user: { id: user.id, name: user.name, role: user.role }, tenant: { id: tenant.id, name: tenant.name, plan: tenant.plan }, device: { id: device.id, name: device.name } });
+    // A device-registration failure must return JSON, never Express's
+    // default HTML error page, which the SPA cannot display.
+    try {
+      const device = matchingDevice || await store.registerDevice({ tenantId: tenant.id, userId: user.id, name: body.data.deviceName, hwidHash });
+      const token = signAccessToken({ sub: user.id, tenantId: tenant.id, deviceId: device.id, plan: tenant.plan, branchIds: user.branchIds, permissions: user.permissions });
+      return response.json({ token, user: { id: user.id, name: user.name, role: user.role }, tenant: { id: tenant.id, name: tenant.name, plan: tenant.plan }, device: { id: device.id, name: device.name } });
+    } catch {
+      return response.status(500).json({ error: "LOGIN_FAILED", message: "Login could not be completed. Try again." });
+    }
   });
 
   router.get("/api/demo/session", async (request, response) => {
@@ -212,6 +218,22 @@ export function buildRouter(store: Store): Router {
       for (const t of tenants) { try { devices += (await store.listDevices(t.id)).length; } catch { /* one tenant's devices must not break health */ } }
       return response.json({ database, tenants: tenants.length, byPlan, byStatus, licenses: licenses.length, byLicense, expiringSoon, devices, generatedAt: new Date().toISOString() });
     } catch { return response.status(503).json({ error: "MASTER_HEALTH_FAILED" }); }
+  });
+  // Master diagnostics: proves whether THIS server's database user can
+  // create and use a tenant database — the exact step public
+  // registration needs. Master-key only. Creates a random probe
+  // database, writes one row in it, then drops it. Returns capability
+  // booleans and the failing step's error code only; no host, user,
+  // password or database name is returned.
+  router.post("/api/master/diagnostics/database-creation", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    if (process.env.STORAGE_MODE !== "mariadb") return response.status(503).json({ error: "STORAGE_NOT_MARIADB", message: "Database creation diagnostics require STORAGE_MODE=mariadb." });
+    try {
+      const probe = await probeDatabaseCreation();
+      return response.json({ ...probe, checkedAt: new Date().toISOString() });
+    } catch (error) {
+      return response.status(503).json({ error: "DIAGNOSTICS_FAILED", code: (error as any)?.code ?? "UNKNOWN" });
+    }
   });
   router.get("/api/master/tenants/:tenantId/devices", async (request, response) => {
     if (!checkMasterKey(request, response)) return;
@@ -390,6 +412,11 @@ export function buildRouter(store: Store): Router {
       const code = error instanceof Error ? error.message : "REGISTER_FAILED";
       if (code === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: code });
       if (code === "LOGIN_ALREADY_EXISTS") return response.status(409).json({ error: code, message: "This login already exists. Please sign in with it, or register with a different login." });
+      // Log the error CODE only (e.g. ER_DBACCESS_DENIED_ERROR) to the
+      // server log so NexPanel logs name the failing step. Never log the
+      // message: MariaDB messages can contain SQL text. The client still
+      // gets only the generic message, by design.
+      console.error("public register failed:", (error as any)?.code ?? code);
       return response.status(503).json({ error: "REGISTER_FAILED", message: "Registration failed. The database or provisioning step did not complete." });
     }
   });
@@ -497,6 +524,9 @@ export function buildRouter(store: Store): Router {
       return response.status(201).json({ tenant: { id: result.tenantId, name: body.data.name, databaseName: result.databaseName, plan: body.data.plan }, ownerUserId: result.ownerUserId, branchId: result.branchId });
     } catch (error) {
       // Never leak database error details (host, user, or SQL) to the client.
+      // Log the error code only to the server log, for the same reason as
+      // the public register catch above.
+      console.error("master provision failed:", (error as any)?.code ?? "PROVISION_FAILED");
       const message = error instanceof Error ? error.message : "PROVISION_FAILED";
       if (message === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: message });
       if (message === "LOGIN_ALREADY_EXISTS") return response.status(409).json({ error: message, message: "This login already exists. Use a different owner login." });

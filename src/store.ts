@@ -1,4 +1,5 @@
 import mariadb from "mariadb";
+import { isTenantDatabaseName } from "./tenantDb.js";
 import { hashPassword, randomId } from "./security.js";
 import { plans, type PermissionCode, type PlanId } from "./catalog.js";
 
@@ -1130,7 +1131,12 @@ class MariaDbHealthStore implements Store {
   }
   async registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">) {
     const id = randomId("device"); const lastSeen = new Date().toISOString();
-    await this.pool.query("INSERT INTO tenant_devices (id, tenant_id, user_id, device_name, hwid_hash, status, last_seen_at) VALUES (?, ?, ?, ?, ?, 'active', ?)", [id, input.tenantId, input.userId, input.name, input.hwidHash, lastSeen]);
+    // MariaDB TIMESTAMP columns reject ISO-8601 strings with "T"/"Z"
+    // under strict mode (error 1292) — this broke login on real MariaDB,
+    // where the memory store never validates the format. Let the database
+    // stamp the row with NOW() instead of binding a JS ISO string. The
+    // returned record still carries the ISO string for JSON responses.
+    await this.pool.query("INSERT INTO tenant_devices (id, tenant_id, user_id, device_name, hwid_hash, status, last_seen_at) VALUES (?, ?, ?, ?, ?, 'active', NOW())", [id, input.tenantId, input.userId, input.name, input.hwidHash]);
     return { ...input, id, status: "active" as const, lastSeen };
   }
   async revokeDevice(tenantId: string, deviceId: string) {
@@ -1162,7 +1168,7 @@ class MariaDbHealthStore implements Store {
     if (cached) return cached;
     const rows = await this.pool.query("SELECT database_name AS databaseName FROM tenants WHERE id = ? LIMIT 1", [tenantId]) as any[];
     const databaseName = rows[0]?.databaseName;
-    if (!databaseName || !/^tenant_[0-9]{6}$/.test(databaseName)) throw new Error("TENANT_DATABASE_NOT_FOUND");
+    if (!databaseName || !isTenantDatabaseName(databaseName)) throw new Error("TENANT_DATABASE_NOT_FOUND");
     const tenantPool = mariadb.createPool({ host: process.env.MARIADB_HOST, port: Number(process.env.MARIADB_PORT || 3306), user: process.env.MARIADB_USER, password: process.env.MARIADB_PASSWORD, database: databaseName, connectionLimit: 5 });
     this.tenantPools.set(tenantId, tenantPool);
     return tenantPool;

@@ -1,4 +1,5 @@
 import mariadb from "mariadb";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -6,6 +7,7 @@ import { hashPassword, randomId } from "./security.js";
 import { plans, type PlanId } from "./catalog.js";
 import { ensureMasterTables } from "./store.js";
 import { masterRegistry } from "./master.js";
+import { tenantDatabaseName, tenantDbPrefix, isTenantDatabaseName } from "./tenantDb.js";
 
 // Phase 1: tenant provisioning for MariaDB only.
 // All database credentials come from environment variables on the server
@@ -42,24 +44,23 @@ export interface ProvisionResult {
 }
 
 function mariadbConfig(database?: string) {
+  // Trim connection values (NexPanel quirk: panel env lines written as
+  // "KEY = value" arrive with spaces). The password is never trimmed:
+  // passwords are opaque and may legitimately contain spaces.
   return {
-    host: process.env.MARIADB_HOST,
-    port: Number(process.env.MARIADB_PORT || 3306),
-    user: process.env.MARIADB_USER,
+    host: (process.env.MARIADB_HOST || "").trim() || undefined,
+    port: Number((process.env.MARIADB_PORT || "").trim() || 3306),
+    user: (process.env.MARIADB_USER || "").trim() || undefined,
     password: process.env.MARIADB_PASSWORD,
-    database,
+    database: database ? database.trim() : undefined,
     connectionLimit: 5,
   };
-}
-
-function isValidDatabaseName(name: string): boolean {
-  return /^tenant_[0-9]{6}$/.test(name);
 }
 
 export async function provisionTenant(input: ProvisionInput): Promise<ProvisionResult> {
   if (!plans[input.plan]) throw new Error("INVALID_PLAN");
   await ensureMasterTables();
-  const masterPool = mariadb.createPool(mariadbConfig(process.env.MARIADB_DATABASE || "master_control"));
+  const masterPool = mariadb.createPool(mariadbConfig((process.env.MARIADB_DATABASE || "").trim() || "master_control"));
   let tenantPool: ReturnType<typeof mariadb.createPool> | null = null;
   try {
     // Login must be unique across ALL tenants (tenant_user_index.login is
@@ -75,22 +76,23 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
     // — a retry would reuse the same number and die on the already-seeded
     // users/ai_credits rows. Pick the first number whose master row AND
     // whose database both do not exist yet.
+    const prefix = tenantDbPrefix();
     let existingSchemas = new Set<string>();
     try {
-      const schemaRows = (await masterPool.query("SELECT SCHEMA_NAME AS name FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE 'tenant\\_%'")) as any[];
-      existingSchemas = new Set(schemaRows.map((r: any) => String(r.name)));
+      const schemaRows = (await masterPool.query("SELECT SCHEMA_NAME AS name FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE ?", [`${prefix}tenant_%`])) as any[];
+      existingSchemas = new Set(schemaRows.map((r: any) => String(r.name)).filter((n) => isTenantDatabaseName(n)));
     } catch { /* schema listing is best-effort; the master-row check still applies */ }
     let next = 1;
     for (let attempt = 0; attempt < 1000; attempt++) {
-      const candidate = `tenant_${String(next).padStart(6, "0")}`;
+      const candidate = tenantDatabaseName(next);
       const rowExists = (await masterPool.query("SELECT id FROM tenants WHERE id = ? LIMIT 1", [candidate])) as any[];
       if (!rowExists.length && !existingSchemas.has(candidate)) break;
       next += 1;
       if (attempt === 999) throw new Error("TENANT_NUMBER_EXHAUSTED");
     }
-    const databaseName = `tenant_${String(next).padStart(6, "0")}`;
+    const databaseName = tenantDatabaseName(next);
     const tenantId = databaseName;
-    if (!isValidDatabaseName(databaseName)) throw new Error("INVALID_DATABASE_NAME");
+    if (!isTenantDatabaseName(databaseName)) throw new Error("INVALID_DATABASE_NAME");
 
     // 1. Create the tenant database. Identifier is server-generated and
     // validated above, so backtick quoting here is safe.
@@ -186,5 +188,67 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
   } finally {
     if (tenantPool) await tenantPool.end().catch(() => undefined);
     await masterPool.end().catch(() => undefined);
+  }
+}
+
+// Master diagnostics: proves whether THIS server's database user can
+// create and use a tenant database — the exact capability public
+// registration needs. Creates one random probe database, writes one row
+// in it, then drops it in a finally block. Returns capability booleans
+// and the failing step's error code only; no host, user, password or
+// database name is ever returned or logged.
+export interface DatabaseCreationProbe {
+  prefix: string;
+  canCreateDatabase: boolean;
+  canUseDatabase: boolean;
+  canWrite: boolean;
+  failedStep: "create" | "use" | "write" | null;
+  code: string | null;
+}
+
+export async function probeDatabaseCreation(): Promise<DatabaseCreationProbe> {
+  const prefix = tenantDbPrefix();
+  const probe = `${prefix}__mbi_probe_${crypto.randomBytes(6).toString("hex")}`;
+  const registryPool = mariadb.createPool(mariadbConfig((process.env.MARIADB_DATABASE || "").trim() || "master_control"));
+  const result: DatabaseCreationProbe = { prefix, canCreateDatabase: false, canUseDatabase: false, canWrite: false, failedStep: null, code: null };
+  try {
+    try {
+      await registryPool.query(`CREATE DATABASE \`${probe}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+      result.canCreateDatabase = true;
+    } catch (error) {
+      result.failedStep = "create";
+      result.code = (error as any)?.code ?? "UNKNOWN";
+      return result;
+    }
+    const probePool = mariadb.createPool(mariadbConfig(probe));
+    try {
+      let conn: any;
+      try {
+        conn = await probePool.getConnection();
+        result.canUseDatabase = true;
+      } catch (error) {
+        result.failedStep = "use";
+        result.code = (error as any)?.code ?? "UNKNOWN";
+        return result;
+      }
+      try {
+        await conn.query("CREATE TABLE IF NOT EXISTS probe (id INT PRIMARY KEY)");
+        await conn.query("INSERT INTO probe (id) VALUES (1)");
+        await conn.query("SELECT id FROM probe WHERE id = 1");
+        result.canWrite = true;
+      } catch (error) {
+        result.failedStep = "write";
+        result.code = (error as any)?.code ?? "UNKNOWN";
+        return result;
+      } finally {
+        conn.release();
+      }
+    } finally {
+      await probePool.end().catch(() => undefined);
+    }
+    return result;
+  } finally {
+    await registryPool.query(`DROP DATABASE IF EXISTS \`${probe}\``).catch(() => undefined);
+    await registryPool.end().catch(() => undefined);
   }
 }
