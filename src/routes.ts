@@ -252,7 +252,7 @@ export function buildRouter(store: Store): Router {
     return response.json({ medicines: await store.listMedicines(request.auth!.tenantId, search) });
   });
   router.post("/api/inventory/medicines", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
-    const body = z.object({ sku: z.string().min(1).max(96), barcode: z.string().max(128).nullable().optional(), name: z.string().min(1).max(220), genericSalt: z.string().max(220).nullable().optional(), strength: z.string().max(120).nullable().optional(), dosageForm: z.string().max(80).nullable().optional(), category: z.string().max(120).nullable().optional() }).safeParse(request.body);
+    const body = z.object({ sku: z.string().min(1).max(96), barcode: z.string().max(128).nullable().optional(), name: z.string().min(1).max(220), genericSalt: z.string().max(220).nullable().optional(), strength: z.string().max(120).nullable().optional(), dosageForm: z.string().max(80).nullable().optional(), category: z.string().max(120).nullable().optional(), isControlled: z.boolean().optional() }).safeParse(request.body);
     if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
     try { return response.status(201).json({ medicine: await store.createMedicine(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapStoreError(error, response); }
   });
@@ -305,7 +305,7 @@ export function buildRouter(store: Store): Router {
   // approval needs purchases.approve; a pending purchase adds no stock.
   function mapPhase3Error(error: unknown, response: Response) {
     const code = error instanceof Error ? error.message : "PHASE3_ERROR";
-    const map: Record<string, number> = { PARTY_NOT_FOUND: 404, SALE_NOT_FOUND: 404, PURCHASE_NOT_FOUND: 404, MEDICINE_NOT_FOUND: 404, RETURN_ITEM_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_DISCOUNT: 400, PAYMENT_MISMATCH: 400, INVALID_AMOUNT: 400, INVALID_ITEMS: 400, CUSTOMER_REQUIRED: 400, RETURN_EXCEEDS_SOLD: 400, ALREADY_RETURNED: 409, ALREADY_APPROVED: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    const map: Record<string, number> = { PARTY_NOT_FOUND: 404, SALE_NOT_FOUND: 404, PURCHASE_NOT_FOUND: 404, MEDICINE_NOT_FOUND: 404, RETURN_ITEM_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_DISCOUNT: 400, PAYMENT_MISMATCH: 400, INVALID_AMOUNT: 400, INVALID_ITEMS: 400, CUSTOMER_REQUIRED: 400, CONTROLLED_PRESCRIPTION_REQUIRED: 400, PRESCRIPTION_QTY_EXCEEDED: 400, PRESCRIPTION_BRANCH_MISMATCH: 400, PRESCRIPTION_NOT_FOUND: 404, PRESCRIPTION_NOT_PENDING: 409, RETURN_EXCEEDS_SOLD: 400, ALREADY_RETURNED: 409, ALREADY_APPROVED: 409, TENANT_DATABASE_NOT_FOUND: 503 };
     const status = map[code] ?? 500;
     return response.status(status).json({ error: code, message: code === "INSUFFICIENT_STOCK" ? "Not enough stock in this branch for this sale. Nothing was sold." : code === "CUSTOMER_REQUIRED" ? "A credit sale needs a customer." : code === "PAYMENT_MISMATCH" ? "Paid amount does not match this sale or purchase total." : "Phase 3 operation failed." });
   }
@@ -333,7 +333,7 @@ export function buildRouter(store: Store): Router {
     return response.json({ sale });
   });
   router.post("/api/sales", requirePermission("sales.create"), async (request: RequestContext, response) => {
-    const body = z.object({ branchId: z.string().min(1), customerId: z.string().min(1).nullable().optional(), items: z.array(z.object({ medicineId: z.string().min(1), quantity: z.number().int().positive() })).min(1).max(100), discount: z.number().min(0).default(0), paymentType: z.enum(["cash", "credit"]), paidAmount: z.number().min(0) }).safeParse(request.body);
+    const body = z.object({ branchId: z.string().min(1), customerId: z.string().min(1).nullable().optional(), prescriptionId: z.string().min(1).nullable().optional(), items: z.array(z.object({ medicineId: z.string().min(1), quantity: z.number().int().positive() })).min(1).max(100), discount: z.number().min(0).default(0), paymentType: z.enum(["cash", "credit"]), paidAmount: z.number().min(0) }).safeParse(request.body);
     if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
     if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
     if (body.data.discount > 0 && !request.auth!.permissions.includes("sales.discount" as never)) return response.status(403).json({ error: "PERMISSION_DENIED", message: "Your account does not have discount permission." });
@@ -418,6 +418,47 @@ export function buildRouter(store: Store): Router {
     const existing = (await store.listTransfers(request.auth!.tenantId)).find((x) => x.id === String(request.params.id));
     if (!existing) return response.status(404).json({ error: "TRANSFER_NOT_FOUND" });
     try { return response.json({ transfer: await store.rejectTransfer(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapPhase4Error(error, response); }
+  });
+
+  // Phase 4 slice 3 — Prescriptions + Controlled drugs, Advanced only.
+  // A controlled medicine cannot be sold without a pending prescription for
+  // the same branch covering the quantity; the sale (or a direct dispense)
+  // marks the prescription dispensed and writes a controlled-drug log entry.
+  function mapSlice3Error(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "SLICE3_ERROR";
+    const map: Record<string, number> = { PRESCRIPTION_NOT_FOUND: 404, MEDICINE_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_ITEMS: 400, CONTROLLED_PRESCRIPTION_REQUIRED: 400, PRESCRIPTION_QTY_EXCEEDED: 400, PRESCRIPTION_BRANCH_MISMATCH: 400, PRESCRIPTION_NOT_PENDING: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    return response.status(map[code] ?? 500).json({ error: code, message: code === "CONTROLLED_PRESCRIPTION_REQUIRED" ? "This controlled medicine needs a valid prescription." : code === "PRESCRIPTION_NOT_PENDING" ? "This prescription is already dispensed or cancelled." : "Prescription operation failed." });
+  }
+  router.post("/api/inventory/medicines/:id/controlled", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const body = z.object({ controlled: z.boolean() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    const medicine = await store.setMedicineControlled(request.auth!.tenantId, request.auth!.sub, String(request.params.id), body.data.controlled);
+    if (!medicine) return response.status(404).json({ error: "MEDICINE_NOT_FOUND" });
+    return response.json({ medicine });
+  });
+  router.post("/api/prescriptions", requirePermission("prescriptions.create"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const body = z.object({ patientName: z.string().min(1).max(220), doctorName: z.string().min(1).max(220), branchId: z.string().min(1), items: z.array(z.object({ medicineId: z.string().min(1), quantity: z.number().int().positive(), dosage: z.string().max(120).nullable().optional(), instructions: z.string().max(300).nullable().optional() })).min(1).max(50) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (!branchAccess(request, body.data.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.status(201).json({ prescription: await store.createPrescription(request.auth!.tenantId, request.auth!.sub, body.data) }); } catch (error) { return mapSlice3Error(error, response); }
+  });
+  router.get("/api/prescriptions", requirePermission("prescriptions.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    return response.json({ prescriptions: await store.listPrescriptions(request.auth!.tenantId) });
+  });
+  router.post("/api/prescriptions/:id/dispense", requirePermission("prescriptions.dispense"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    try { return response.json({ prescription: await store.dispensePrescription(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapSlice3Error(error, response); }
+  });
+  router.post("/api/prescriptions/:id/cancel", requirePermission("prescriptions.dispense"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    try { return response.json({ prescription: await store.cancelPrescription(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapSlice3Error(error, response); }
+  });
+  router.get("/api/controlled-log", requirePermission("prescriptions.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    return response.json({ logs: await store.listControlledLogs(request.auth!.tenantId) });
   });
 
   // Phase 4 slice 2 — Accounting, Advanced only. No separate stored ledger:

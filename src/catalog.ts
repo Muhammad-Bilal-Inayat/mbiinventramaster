@@ -19,6 +19,8 @@ export type PermissionCode =
   | "transfers.request"
   | "transfers.approve"
   | "prescriptions.view"
+  | "prescriptions.create"
+  | "prescriptions.dispense"
   | "accounting.view"
   | "admin.users"
   | "admin.devices";
@@ -84,6 +86,8 @@ export const permissionLabels: Record<PermissionCode, string> = {
   "transfers.request": "Request transfer",
   "transfers.approve": "Approve transfer",
   "prescriptions.view": "View prescriptions",
+  "prescriptions.create": "Create prescription",
+  "prescriptions.dispense": "Dispense prescription",
   "accounting.view": "View accounting",
   "admin.users": "Manage users",
   "admin.devices": "Manage devices",

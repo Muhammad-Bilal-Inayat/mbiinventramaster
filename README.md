@@ -80,6 +80,29 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 4 slice 3: Prescriptions + Controlled drugs (local, not pushed yet)
+
+Advanced only, same rule as slices 1–2. New permissions
+prescriptions.create / prescriptions.dispense (owner + pharmacist;
+provisioned owners get them too).
+- Medicine flag isControlled (create form checkbox, or
+  POST /api/inventory/medicines/:id/controlled, inventory.edit).
+- Prescriptions: create (patient, doctor, branch, items with dosage),
+  list, dispense (FEFO stock deduction, no sale), cancel (pending only).
+- Controlled sale gate: a controlled medicine in a POS sale needs a
+  PENDING prescription for the same branch covering the quantity
+  (else 400 CONTROLLED_PRESCRIPTION_REQUIRED / PRESCRIPTION_QTY_EXCEEDED);
+  the sale marks the prescription dispensed. Reuse of a dispensed
+  prescription is 409. Every controlled sale and dispense writes a
+  controlled-log entry (GET /api/controlled-log).
+- Frontend: new Prescriptions nav page (create, dispense, cancel,
+  controlled log), Prescription ID field on the Sales page, controlled
+  checkbox on the Add medicine form.
+- Migration db/migrations/007_tenant_prescriptions_controlled.sql
+  (tenant DBs only; tables + is_controlled column also auto-created).
+- Remaining Phase 4 modules NOT built yet: online store, staff
+  attendance/payroll.
+
 ## Phase 4 slice 2: Accounting (pushed, commit 54fd7e1)
 
 Advanced only, same rule as slice 1. No separate stored ledger table:

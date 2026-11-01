@@ -23,6 +23,7 @@ export interface MedicineRecord {
   dosageForm: string | null;
   category: string | null;
   active: boolean;
+  isControlled: boolean;
   totalStock: number;
 }
 
@@ -120,6 +121,17 @@ export interface SalesReport {
   sales: SaleRecord[];
 }
 
+export interface PrescriptionItemInput { medicineId: string; quantity: number; dosage?: string | null; instructions?: string | null; }
+export interface PrescriptionRecord {
+  id: string; patientName: string; doctorName: string; branchId: string;
+  status: "pending" | "dispensed" | "cancelled";
+  items: Array<{ medicineId: string; quantity: number; dosage: string | null; instructions: string | null }>;
+  createdAt: string;
+}
+export interface ControlledLogRecord {
+  id: string; medicineId: string; batchId: string; branchId: string; quantity: number;
+  prescriptionId: string | null; action: "sale" | "dispense"; createdBy: string; createdAt: string;
+}
 export interface AccountingSummary {
   revenue: number;
   purchases: number;
@@ -209,7 +221,7 @@ export interface Store {
   setAiCredits(tenantId: string, input: { total: number; enabled: boolean }): Promise<AiCredits>;
   consumeAiCredit(tenantId: string, plan: PlanId): Promise<{ ok: boolean; reason?: string; credits: AiCredits }>;
   listMedicines(tenantId: string, search: string): Promise<MedicineRecord[]>;
-  createMedicine(tenantId: string, userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null }): Promise<MedicineRecord>;
+  createMedicine(tenantId: string, userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null; isControlled?: boolean }): Promise<MedicineRecord>;
   setMedicineActive(tenantId: string, userId: string, medicineId: string, active: boolean): Promise<MedicineRecord | undefined>;
   listBatches(tenantId: string, medicineId: string): Promise<BatchRecord[]>;
   createBatch(tenantId: string, userId: string, input: { medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number }): Promise<BatchRecord>;
@@ -220,7 +232,7 @@ export interface Store {
   listParties(tenantId: string, type?: string): Promise<PartyRecord[]>;
   getPartyBalance(tenantId: string, partyId: string): Promise<{ party: PartyRecord; balance: number; entries: KhataEntryRecord[] }>;
   payParty(tenantId: string, userId: string, input: { partyId: string; amount: number; note?: string | null }): Promise<KhataEntryRecord>;
-  createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }): Promise<SaleRecord>;
+  createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; prescriptionId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }): Promise<SaleRecord>;
   getSale(tenantId: string, saleId: string): Promise<SaleRecord | undefined>;
   listSales(tenantId: string): Promise<SaleRecord[]>;
   returnSale(tenantId: string, userId: string, saleId: string, items: Array<{ medicineId: string; batchId: string; quantity: number }>): Promise<SaleRecord>;
@@ -233,15 +245,21 @@ export interface Store {
   approveTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
   rejectTransfer(tenantId: string, userId: string, transferId: string): Promise<TransferRecord>;
   getAccounting(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<AccountingSummary>;
+  setMedicineControlled(tenantId: string, userId: string, medicineId: string, controlled: boolean): Promise<MedicineRecord | undefined>;
+  createPrescription(tenantId: string, userId: string, input: { patientName: string; doctorName: string; branchId: string; items: PrescriptionItemInput[] }): Promise<PrescriptionRecord>;
+  listPrescriptions(tenantId: string): Promise<PrescriptionRecord[]>;
+  dispensePrescription(tenantId: string, userId: string, prescriptionId: string): Promise<PrescriptionRecord>;
+  cancelPrescription(tenantId: string, userId: string, prescriptionId: string): Promise<PrescriptionRecord>;
+  listControlledLogs(tenantId: string): Promise<ControlledLogRecord[]>;
 }
 
 const ownerPermissions: PermissionCode[] = [
   "dashboard.view", "sales.view", "sales.create", "sales.refund", "sales.discount", "inventory.view", "inventory.edit", "inventory.adjust",
   "purchases.view", "purchases.create", "purchases.approve", "parties.view", "parties.payment", "reports.view", "reports.export",
-  "transfers.request", "transfers.approve", "prescriptions.view", "accounting.view", "admin.users", "admin.devices",
+  "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "accounting.view", "admin.users", "admin.devices",
 ];
 const managerPermissions = ownerPermissions.filter((permission) => !["admin.users", "accounting.view"].includes(permission));
-const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view"];
+const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view", "prescriptions.create", "prescriptions.dispense"];
 
 class MemoryStore implements Store {
   private tenants = new Map<string, TenantRecord>();
@@ -355,6 +373,8 @@ class MemoryStore implements Store {
   private saleSeq = 0;
   private purchaseSeq = 0;
   private transfers = new Map<string, TransferRecord & { tenantId: string }>();
+  private prescriptions = new Map<string, PrescriptionRecord & { tenantId: string }>();
+  private controlledLogs: Array<ControlledLogRecord & { tenantId: string }> = [];
   private partyToRecord(party: PartyRecord & { tenantId: string }): PartyRecord {
     const { tenantId: _t, ...rest } = party; return rest;
   }
@@ -403,14 +423,14 @@ class MemoryStore implements Store {
       .map((m) => { const { tenantId: _t, ...rest } = m; return { ...rest, totalStock: this.medicineTotalStock(tenantId, m.id) }; })
       .sort((a, b) => a.name.localeCompare(b.name));
   }
-  async createMedicine(tenantId: string, _userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null }) {
+  async createMedicine(tenantId: string, _userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null; isControlled?: boolean }) {
     const skuExists = [...this.medicines.values()].some((m) => m.tenantId === tenantId && m.sku.toLowerCase() === input.sku.toLowerCase());
     if (skuExists) throw new Error("SKU_ALREADY_EXISTS");
     if (input.barcode) {
       const barcodeExists = [...this.medicines.values()].some((m) => m.tenantId === tenantId && m.barcode === input.barcode);
       if (barcodeExists) throw new Error("BARCODE_ALREADY_EXISTS");
     }
-    const medicine: MedicineRecord & { tenantId: string } = { id: randomId("medicine"), tenantId, sku: input.sku, barcode: input.barcode ?? null, name: input.name, genericSalt: input.genericSalt ?? null, strength: input.strength ?? null, dosageForm: input.dosageForm ?? null, category: input.category ?? null, active: true, totalStock: 0 };
+    const medicine: MedicineRecord & { tenantId: string } = { id: randomId("medicine"), tenantId, sku: input.sku, barcode: input.barcode ?? null, name: input.name, genericSalt: input.genericSalt ?? null, strength: input.strength ?? null, dosageForm: input.dosageForm ?? null, category: input.category ?? null, active: true, isControlled: (input as any).isControlled ?? false, totalStock: 0 };
     this.medicines.set(medicine.id, medicine);
     const { tenantId: _t2, ...medRest } = medicine; return { ...medRest, totalStock: 0 };
   }
@@ -419,6 +439,64 @@ class MemoryStore implements Store {
     if (!medicine || medicine.tenantId !== tenantId) return undefined;
     medicine.active = active;
     const { tenantId: _t3, ...medRest } = medicine; return { ...medRest, totalStock: this.medicineTotalStock(tenantId, medicineId) };
+  }
+  async setMedicineControlled(tenantId: string, _userId: string, medicineId: string, controlled: boolean) {
+    const medicine = this.medicines.get(medicineId);
+    if (!medicine || medicine.tenantId !== tenantId) return undefined;
+    medicine.isControlled = controlled;
+    const { tenantId: _t4, ...medRest } = medicine; return { ...medRest, totalStock: this.medicineTotalStock(tenantId, medicineId) };
+  }
+  async createPrescription(tenantId: string, _userId: string, input: { patientName: string; doctorName: string; branchId: string; items: PrescriptionItemInput[] }) {
+    if (!input.patientName?.trim() || !input.doctorName?.trim() || !input.items.length) throw new Error("INVALID_ITEMS");
+    for (const item of input.items) {
+      const medicine = this.medicines.get(item.medicineId);
+      if (!medicine || medicine.tenantId !== tenantId || !medicine.active) throw new Error("MEDICINE_NOT_FOUND");
+      if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+    }
+    const rx: PrescriptionRecord & { tenantId: string } = { id: randomId("prescription"), tenantId, patientName: input.patientName, doctorName: input.doctorName, branchId: input.branchId, status: "pending", items: input.items.map((i) => ({ medicineId: i.medicineId, quantity: i.quantity, dosage: i.dosage ?? null, instructions: i.instructions ?? null })), createdAt: new Date().toISOString() };
+    this.prescriptions.set(rx.id, rx);
+    const { tenantId: _t5, ...rest } = rx; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
+  async listPrescriptions(tenantId: string) {
+    return [...this.prescriptions.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => { const { tenantId: _t, ...rest } = x; return { ...rest, items: rest.items.map((i) => ({ ...i })) }; });
+  }
+  async dispensePrescription(tenantId: string, userId: string, prescriptionId: string) {
+    const rx = this.prescriptions.get(prescriptionId);
+    if (!rx || rx.tenantId !== tenantId) throw new Error("PRESCRIPTION_NOT_FOUND");
+    if (rx.status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+    const today = new Date().toISOString().slice(0, 10);
+    for (const item of rx.items) {
+      const candidates = [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === item.medicineId && b.expiryDate >= today).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+      let remaining = item.quantity;
+      for (const batch of candidates) { const row = this.stock.get(`${rx.branchId}:${batch.id}`); remaining -= Math.min(remaining, row?.quantity ?? 0); if (remaining <= 0) break; }
+      if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+    }
+    for (const item of rx.items) {
+      let remaining = item.quantity;
+      const candidates = [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === item.medicineId && b.expiryDate >= today).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+      for (const batch of candidates) {
+        if (remaining <= 0) break;
+        const key = `${rx.branchId}:${batch.id}`; const row = this.stock.get(key); const avail = row?.quantity ?? 0; if (avail <= 0) continue;
+        const take = Math.min(remaining, avail); row!.quantity -= take; this.stock.set(key, row!);
+        this.movementSeq += 1;
+        this.movements.push({ id: randomId("movement"), branchId: rx.branchId, batchId: batch.id, movementType: "dispense", quantity: -take, referenceId: rx.id, idempotencyKey: `dispense-${rx.id}-${batch.id}`, serverVersion: this.movementSeq });
+        const medicine = this.medicines.get(item.medicineId);
+        if (medicine?.isControlled) this.controlledLogs.push({ id: randomId("controlled"), tenantId, medicineId: item.medicineId, batchId: batch.id, branchId: rx.branchId, quantity: take, prescriptionId: rx.id, action: "dispense", createdBy: userId, createdAt: new Date().toISOString() });
+        remaining -= take;
+      }
+    }
+    rx.status = "dispensed";
+    const { tenantId: _t6, ...rest } = rx; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
+  async cancelPrescription(tenantId: string, _userId: string, prescriptionId: string) {
+    const rx = this.prescriptions.get(prescriptionId);
+    if (!rx || rx.tenantId !== tenantId) throw new Error("PRESCRIPTION_NOT_FOUND");
+    if (rx.status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+    rx.status = "cancelled";
+    const { tenantId: _t7, ...rest } = rx; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
+  async listControlledLogs(tenantId: string) {
+    return this.controlledLogs.filter((log) => log.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((l) => { const { tenantId: _t, ...rest } = l; return rest; });
   }
   async listBatches(tenantId: string, medicineId: string) {
     return [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === medicineId).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate)).map((b) => this.batchToRecord(tenantId, b));
@@ -515,13 +593,28 @@ class MemoryStore implements Store {
     }
     return entry;
   }
-  async createSale(tenantId: string, _userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
+  async createSale(tenantId: string, _userId: string, input: { branchId: string; customerId?: string | null; prescriptionId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
     const today = new Date().toISOString().slice(0, 10);
     if (!input.items.length) throw new Error("INVALID_ITEMS");
     if (input.paymentType === "credit" && !input.customerId) throw new Error("CUSTOMER_REQUIRED");
     if (input.customerId) {
       const party = this.parties.get(input.customerId);
       if (!party || party.tenantId !== tenantId || party.type !== "customer") throw new Error("PARTY_NOT_FOUND");
+    }
+    // Slice 3 gate: a controlled medicine may only be sold against a pending
+    // prescription for the same branch, covering at least the sold quantity.
+    const controlledItems = input.items.filter((item) => this.medicines.get(item.medicineId)?.isControlled);
+    let gateRx: (PrescriptionRecord & { tenantId: string }) | undefined;
+    if (controlledItems.length) {
+      if (!input.prescriptionId) throw new Error("CONTROLLED_PRESCRIPTION_REQUIRED");
+      gateRx = this.prescriptions.get(input.prescriptionId);
+      if (!gateRx || gateRx.tenantId !== tenantId) throw new Error("PRESCRIPTION_NOT_FOUND");
+      if (gateRx.branchId !== input.branchId) throw new Error("PRESCRIPTION_BRANCH_MISMATCH");
+      if (gateRx.status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+      for (const item of controlledItems) {
+        const rxItem = gateRx.items.find((i) => i.medicineId === item.medicineId);
+        if (!rxItem || rxItem.quantity < item.quantity) throw new Error("PRESCRIPTION_QTY_EXCEEDED");
+      }
     }
     // FEFO allocation, fully pre-checked before any stock moves.
     const allocations: Array<{ medicineId: string; batchId: string; batchNo: string; quantity: number; unitPrice: number }> = [];
@@ -559,6 +652,13 @@ class MemoryStore implements Store {
     }
     const sale: SaleRecord & { tenantId: string } = { id: saleId, tenantId, invoiceNo, branchId: input.branchId, customerId: input.customerId ?? null, subtotal, discount: input.discount, total, paidAmount: input.paidAmount, balanceDue, paymentType: input.paymentType, status: "completed", items: allocations.map((a) => ({ ...a, returnedQuantity: 0 })), createdAt: new Date().toISOString() };
     this.sales.set(saleId, sale);
+    if (gateRx) {
+      gateRx.status = "dispensed";
+      for (const a of allocations) {
+        if (!this.medicines.get(a.medicineId)?.isControlled) continue;
+        this.controlledLogs.push({ id: randomId("controlled"), tenantId, medicineId: a.medicineId, batchId: a.batchId, branchId: input.branchId, quantity: a.quantity, prescriptionId: gateRx.id, action: "sale", createdBy: _userId, createdAt: new Date().toISOString() });
+      }
+    }
     if (balanceDue > 0 && input.customerId) this.addKhata(tenantId, input.customerId, "sale_credit", balanceDue, 0, saleId, `Sale ${invoiceNo} credit`);
     return this.saleToRecord(sale);
   }
@@ -872,17 +972,18 @@ class MariaDbHealthStore implements Store {
   }
   async listMedicines(tenantId: string, search: string) {
     const tenantPool = await this.getTenantPool(tenantId);
-    await this.ensureInventoryTables(tenantPool);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Slice3Tables(tenantPool);
     const q = `%${search.trim()}%`;
-    const rows = await tenantPool.query("SELECT m.id, m.sku, m.barcode, m.name, m.generic_salt AS genericSalt, m.strength, m.dosage_form AS dosageForm, m.category, m.active, COALESCE(SUM(bs.quantity), 0) AS totalStock FROM medicines m LEFT JOIN medicine_batches b ON b.medicine_id = m.id LEFT JOIN branch_stock bs ON bs.batch_id = b.id WHERE (? = '%%' OR m.name LIKE ? OR m.sku LIKE ? OR m.barcode LIKE ?) GROUP BY m.id ORDER BY m.name", [q, q, q, q]) as any[];
-    return rows.map((r: any) => ({ id: r.id, sku: r.sku, barcode: r.barcode, name: r.name, genericSalt: r.genericSalt, strength: r.strength, dosageForm: r.dosageForm, category: r.category, active: Boolean(r.active), totalStock: Number(r.totalStock) }));
+    const rows = await tenantPool.query("SELECT m.id, m.sku, m.barcode, m.name, m.generic_salt AS genericSalt, m.strength, m.dosage_form AS dosageForm, m.category, m.active, COALESCE(m.is_controlled, FALSE) AS isControlled, COALESCE(SUM(bs.quantity), 0) AS totalStock FROM medicines m LEFT JOIN medicine_batches b ON b.medicine_id = m.id LEFT JOIN branch_stock bs ON bs.batch_id = b.id WHERE (? = '%%' OR m.name LIKE ? OR m.sku LIKE ? OR m.barcode LIKE ?) GROUP BY m.id ORDER BY m.name", [q, q, q, q]) as any[];
+    return rows.map((r: any) => ({ id: r.id, sku: r.sku, barcode: r.barcode, name: r.name, genericSalt: r.genericSalt, strength: r.strength, dosageForm: r.dosageForm, category: r.category, active: Boolean(r.active), isControlled: Boolean(r.isControlled), totalStock: Number(r.totalStock) }));
   }
-  async createMedicine(tenantId: string, userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null }) {
+  async createMedicine(tenantId: string, userId: string, input: { sku: string; barcode?: string | null; name: string; genericSalt?: string | null; strength?: string | null; dosageForm?: string | null; category?: string | null; isControlled?: boolean }) {
     const tenantPool = await this.getTenantPool(tenantId);
     await this.ensureInventoryTables(tenantPool);
     const id = randomId("medicine");
     try {
-      await tenantPool.query("INSERT INTO medicines (id, sku, barcode, name, generic_salt, strength, dosage_form, category, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)", [id, input.sku, input.barcode ?? null, input.name, input.genericSalt ?? null, input.strength ?? null, input.dosageForm ?? null, input.category ?? null]);
+      await this.ensurePhase4Slice3Tables(tenantPool);
+      await tenantPool.query("INSERT INTO medicines (id, sku, barcode, name, generic_salt, strength, dosage_form, category, active, is_controlled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?)", [id, input.sku, input.barcode ?? null, input.name, input.genericSalt ?? null, input.strength ?? null, input.dosageForm ?? null, input.category ?? null, (input as any).isControlled ? 1 : 0]);
     } catch (error: any) {
       if (String(error?.code) === "ER_DUP_ENTRY") {
         const msg = String(error?.message ?? "");
@@ -892,7 +993,7 @@ class MariaDbHealthStore implements Store {
       throw error;
     }
     await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'medicine.create', 'medicine', ?, ?)", [userId, id, JSON.stringify(input)]);
-    return { id, sku: input.sku, barcode: input.barcode ?? null, name: input.name, genericSalt: input.genericSalt ?? null, strength: input.strength ?? null, dosageForm: input.dosageForm ?? null, category: input.category ?? null, active: true, totalStock: 0 };
+    return { id, sku: input.sku, barcode: input.barcode ?? null, name: input.name, genericSalt: input.genericSalt ?? null, strength: input.strength ?? null, dosageForm: input.dosageForm ?? null, category: input.category ?? null, active: true, isControlled: (input as any).isControlled ?? false, totalStock: 0 };
   }
   async setMedicineActive(tenantId: string, userId: string, medicineId: string, active: boolean) {
     const tenantPool = await this.getTenantPool(tenantId);
@@ -902,6 +1003,94 @@ class MariaDbHealthStore implements Store {
     await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, ?, 'medicine', ?, ?)", [userId, active ? "medicine.activate" : "medicine.deactivate", medicineId, JSON.stringify({ active })]);
     const rows = await this.listMedicines(tenantId, "");
     return rows.find((m) => m.id === medicineId);
+  }
+  async setMedicineControlled(tenantId: string, _userId: string, medicineId: string, controlled: boolean) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice3Tables(tenantPool);
+    const result = await tenantPool.query("UPDATE medicines SET is_controlled = ? WHERE id = ?", [controlled ? 1 : 0, medicineId]) as { affectedRows?: number };
+    if (!result.affectedRows) return undefined;
+    const rows = await tenantPool.query("SELECT m.id, m.sku, m.barcode, m.name, m.generic_salt AS genericSalt, m.strength, m.dosage_form AS dosageForm, m.category, m.active, COALESCE(m.is_controlled, FALSE) AS isControlled, COALESCE(SUM(bs.quantity), 0) AS totalStock FROM medicines m LEFT JOIN medicine_batches b ON b.medicine_id = m.id LEFT JOIN branch_stock bs ON bs.batch_id = b.id WHERE m.id = ? GROUP BY m.id", [medicineId]) as any[];
+    const r = rows[0]; if (!r) return undefined;
+    return { id: r.id, sku: r.sku, barcode: r.barcode, name: r.name, genericSalt: r.genericSalt, strength: r.strength, dosageForm: r.dosageForm, category: r.category, active: Boolean(r.active), isControlled: Boolean(r.isControlled), totalStock: Number(r.totalStock) };
+  }
+  private async loadPrescription(tenantPool: any, prescriptionId: string): Promise<PrescriptionRecord | undefined> {
+    const rows = await tenantPool.query("SELECT id, patient_name AS patientName, doctor_name AS doctorName, branch_id AS branchId, status, created_at AS createdAt FROM prescriptions WHERE id = ? LIMIT 1", [prescriptionId]) as any[];
+    const r = rows[0]; if (!r) return undefined;
+    const items = await tenantPool.query("SELECT medicine_id AS medicineId, quantity, dosage, instructions FROM prescription_items WHERE prescription_id = ?", [prescriptionId]) as any[];
+    return { id: r.id, patientName: r.patientName, doctorName: r.doctorName, branchId: r.branchId, status: r.status, items: items.map((i: any) => ({ medicineId: i.medicineId, quantity: Number(i.quantity), dosage: i.dosage, instructions: i.instructions })), createdAt: String(r.createdAt) };
+  }
+  async createPrescription(tenantId: string, userId: string, input: { patientName: string; doctorName: string; branchId: string; items: PrescriptionItemInput[] }) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice3Tables(tenantPool);
+    if (!input.patientName?.trim() || !input.doctorName?.trim() || !input.items.length) throw new Error("INVALID_ITEMS");
+    for (const item of input.items) {
+      const med = await tenantPool.query("SELECT active FROM medicines WHERE id = ? LIMIT 1", [item.medicineId]) as any[];
+      if (!med.length || !med[0].active) throw new Error("MEDICINE_NOT_FOUND");
+      if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+    }
+    const id = randomId("prescription");
+    await tenantPool.query("INSERT INTO prescriptions (id, patient_name, doctor_name, branch_id, status, created_by) VALUES (?, ?, ?, ?, 'pending', ?)", [id, input.patientName, input.doctorName, input.branchId, userId]);
+    for (const item of input.items) await tenantPool.query("INSERT INTO prescription_items (prescription_id, medicine_id, quantity, dosage, instructions) VALUES (?, ?, ?, ?, ?)", [id, item.medicineId, item.quantity, item.dosage ?? null, item.instructions ?? null]);
+    return (await this.loadPrescription(tenantPool, id))!;
+  }
+  async listPrescriptions(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id FROM prescriptions ORDER BY created_at DESC LIMIT 200") as any[];
+    const out: PrescriptionRecord[] = [];
+    for (const r of rows) { const rx = await this.loadPrescription(tenantPool, r.id); if (rx) out.push(rx); }
+    return out;
+  }
+  async dispensePrescription(tenantId: string, userId: string, prescriptionId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Slice3Tables(tenantPool);
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const rxRows = await connection.query("SELECT id, branch_id AS branchId, status FROM prescriptions WHERE id = ? FOR UPDATE", [prescriptionId]) as any[];
+      if (!rxRows.length) throw new Error("PRESCRIPTION_NOT_FOUND");
+      if (rxRows[0].status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+      const branchId = rxRows[0].branchId;
+      const items = await connection.query("SELECT medicine_id AS medicineId, quantity FROM prescription_items WHERE prescription_id = ?", [prescriptionId]) as any[];
+      for (const item of items) {
+        const candidates = await connection.query("SELECT b.id, bs.quantity FROM medicine_batches b JOIN branch_stock bs ON bs.batch_id = b.id WHERE b.medicine_id = ? AND bs.branch_id = ? AND bs.quantity > 0 AND b.expiry_date >= CURDATE() ORDER BY b.expiry_date FOR UPDATE", [item.medicineId, branchId]) as any[];
+        let remaining = Number(item.quantity);
+        for (const c of candidates) { remaining -= Math.min(remaining, Number(c.quantity)); if (remaining <= 0) break; }
+        if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+        let left = Number(item.quantity);
+        const controlled = await connection.query("SELECT is_controlled AS isControlled FROM medicines WHERE id = ? LIMIT 1", [item.medicineId]) as any[];
+        for (const c of candidates) {
+          if (left <= 0) break;
+          const take = Math.min(left, Number(c.quantity));
+          await connection.query("UPDATE branch_stock SET quantity = quantity - ? WHERE branch_id = ? AND batch_id = ?", [take, branchId, c.id]);
+          await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'dispense', ?, ?, ?, 0, ?)", [randomId("movement"), branchId, c.id, -take, prescriptionId, `dispense-${prescriptionId}-${c.id}`, userId]);
+          if (controlled[0]?.isControlled) await connection.query("INSERT INTO controlled_logs (id, medicine_id, batch_id, branch_id, quantity, prescription_id, action, created_by) VALUES (?, ?, ?, ?, ?, ?, 'dispense', ?)", [randomId("controlled"), item.medicineId, c.id, branchId, take, prescriptionId, userId]);
+          left -= take;
+        }
+      }
+      await connection.query("UPDATE prescriptions SET status = 'dispensed' WHERE id = ?", [prescriptionId]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'prescription.dispense', 'prescription', ?, ?)", [userId, prescriptionId, JSON.stringify({ status: "dispensed" })]);
+      await connection.commit();
+      return (await this.loadPrescription(tenantPool, prescriptionId))!;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async cancelPrescription(tenantId: string, userId: string, prescriptionId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice3Tables(tenantPool);
+    const rx = await this.loadPrescription(tenantPool, prescriptionId);
+    if (!rx) throw new Error("PRESCRIPTION_NOT_FOUND");
+    if (rx.status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+    await tenantPool.query("UPDATE prescriptions SET status = 'cancelled' WHERE id = ?", [prescriptionId]);
+    await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'prescription.cancel', 'prescription', ?, ?)", [userId, prescriptionId, JSON.stringify({ status: "cancelled" })]);
+    return (await this.loadPrescription(tenantPool, prescriptionId))!;
+  }
+  async listControlledLogs(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id, medicine_id AS medicineId, batch_id AS batchId, branch_id AS branchId, quantity, prescription_id AS prescriptionId, action, created_by AS createdBy, created_at AS createdAt FROM controlled_logs ORDER BY created_at DESC LIMIT 200") as any[];
+    return rows.map((r: any) => ({ id: r.id, medicineId: r.medicineId, batchId: r.batchId, branchId: r.branchId, quantity: Number(r.quantity), prescriptionId: r.prescriptionId, action: r.action, createdBy: r.createdBy, createdAt: String(r.createdAt) }));
   }
   async listBatches(tenantId: string, medicineId: string) {
     const tenantPool = await this.getTenantPool(tenantId);
@@ -1068,9 +1257,9 @@ class MariaDbHealthStore implements Store {
       await connection.rollback().catch(() => undefined); throw error;
     } finally { connection.release(); }
   }
-  async createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
+  async createSale(tenantId: string, userId: string, input: { branchId: string; customerId?: string | null; prescriptionId?: string | null; items: Array<{ medicineId: string; quantity: number }>; discount: number; paymentType: "cash" | "credit"; paidAmount: number }) {
     const tenantPool = await this.getTenantPool(tenantId);
-    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool); await this.ensurePhase4Slice3Tables(tenantPool);
     if (!input.items.length) throw new Error("INVALID_ITEMS");
     if (input.paymentType === "credit" && !input.customerId) throw new Error("CUSTOMER_REQUIRED");
     const connection = await tenantPool.getConnection();
@@ -1079,6 +1268,26 @@ class MariaDbHealthStore implements Store {
       if (input.customerId) {
         const cust = await connection.query("SELECT type FROM parties WHERE id = ? LIMIT 1", [input.customerId]) as any[];
         if (!cust.length || cust[0].type !== "customer") throw new Error("PARTY_NOT_FOUND");
+      }
+      // Slice 3 gate: controlled medicines need a pending prescription for this branch.
+      const controlledIds: string[] = [];
+      for (const item of input.items) {
+        const ctrl = await connection.query("SELECT is_controlled AS isControlled FROM medicines WHERE id = ? LIMIT 1", [item.medicineId]) as any[];
+        if (ctrl[0]?.isControlled) controlledIds.push(item.medicineId);
+      }
+      let gateRx: any;
+      if (controlledIds.length) {
+        if (!input.prescriptionId) throw new Error("CONTROLLED_PRESCRIPTION_REQUIRED");
+        const rxRows = await connection.query("SELECT id, branch_id AS branchId, status FROM prescriptions WHERE id = ? FOR UPDATE", [input.prescriptionId]) as any[];
+        if (!rxRows.length) throw new Error("PRESCRIPTION_NOT_FOUND");
+        gateRx = rxRows[0];
+        if (gateRx.branchId !== input.branchId) throw new Error("PRESCRIPTION_BRANCH_MISMATCH");
+        if (gateRx.status !== "pending") throw new Error("PRESCRIPTION_NOT_PENDING");
+        const rxItems = await connection.query("SELECT medicine_id AS medicineId, quantity FROM prescription_items WHERE prescription_id = ?", [input.prescriptionId]) as any[];
+        for (const item of input.items.filter((i) => controlledIds.includes(i.medicineId))) {
+          const rxItem = rxItems.find((r: any) => r.medicineId === item.medicineId);
+          if (!rxItem || Number(rxItem.quantity) < item.quantity) throw new Error("PRESCRIPTION_QTY_EXCEEDED");
+        }
       }
       const allocations: Array<{ medicineId: string; batchId: string; batchNo: string; quantity: number; unitPrice: number }> = [];
       for (const item of input.items) {
@@ -1118,6 +1327,13 @@ class MariaDbHealthStore implements Store {
         await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'sale', ?, ?, ?, 0, ?)", [randomId("movement"), input.branchId, a.batchId, -a.quantity, saleId, `sale-${saleId}-${a.batchId}`, userId]);
       }
       if (balanceDue > 0 && input.customerId) await connection.query("INSERT INTO khata_entries (party_id, entry_type, debit, credit, reference_id, note) VALUES (?, 'sale_credit', ?, 0, ?, ?)", [input.customerId, balanceDue, saleId, `Sale ${invoiceNo} credit`]);
+      if (gateRx) {
+        await connection.query("UPDATE prescriptions SET status = 'dispensed' WHERE id = ?", [gateRx.id]);
+        for (const a of allocations) {
+          if (!controlledIds.includes(a.medicineId)) continue;
+          await connection.query("INSERT INTO controlled_logs (id, medicine_id, batch_id, branch_id, quantity, prescription_id, action, created_by) VALUES (?, ?, ?, ?, ?, ?, 'sale', ?)", [randomId("controlled"), a.medicineId, a.batchId, input.branchId, a.quantity, gateRx.id, userId]);
+        }
+      }
       await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'sale.create', 'sale', ?, ?)", [userId, saleId, JSON.stringify({ invoiceNo, total })]);
       await connection.commit();
       return { id: saleId, invoiceNo, branchId: input.branchId, customerId: input.customerId ?? null, subtotal, discount: input.discount, total, paidAmount: input.paidAmount, balanceDue, paymentType: input.paymentType, status: "completed" as const, items: allocations.map((a) => ({ ...a, returnedQuantity: 0 })), createdAt: new Date().toISOString() };
@@ -1253,6 +1469,13 @@ class MariaDbHealthStore implements Store {
     } catch (error) {
       await connection.rollback().catch(() => undefined); throw error;
     } finally { connection.release(); }
+  }
+  private async ensurePhase4Slice3Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    const col = await tenantPool.query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'medicines' AND COLUMN_NAME = 'is_controlled'") as any[];
+    if (!Number(col[0]?.n ?? 0)) await tenantPool.query("ALTER TABLE medicines ADD COLUMN is_controlled BOOLEAN NOT NULL DEFAULT FALSE");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS prescriptions (id VARCHAR(96) PRIMARY KEY, patient_name VARCHAR(220) NOT NULL, doctor_name VARCHAR(220) NOT NULL, branch_id VARCHAR(96) NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'pending', created_by VARCHAR(96) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_rx_status (status)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS prescription_items (prescription_id VARCHAR(96) NOT NULL, medicine_id VARCHAR(96) NOT NULL, quantity INT NOT NULL, dosage VARCHAR(120) NULL, instructions VARCHAR(300) NULL, PRIMARY KEY (prescription_id, medicine_id)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS controlled_logs (id VARCHAR(96) PRIMARY KEY, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, branch_id VARCHAR(96) NOT NULL, quantity INT NOT NULL, prescription_id VARCHAR(96) NULL, action VARCHAR(30) NOT NULL, created_by VARCHAR(96) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_controlled_medicine (medicine_id)) ENGINE=InnoDB");
   }
   private async ensurePhase4Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
     await tenantPool.query("CREATE TABLE IF NOT EXISTS transfers (id VARCHAR(96) PRIMARY KEY, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, batch_no VARCHAR(96) NOT NULL, from_branch_id VARCHAR(96) NOT NULL, to_branch_id VARCHAR(96) NOT NULL, quantity INT NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'pending', created_by VARCHAR(96) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_transfer_status (status)) ENGINE=InnoDB");
