@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 4 slice 1: Reports/Export + Branch Transfer (local, not pushed yet)
+## Phase 4 slice 1: Reports/Export + Branch Transfer (pushed, commit c1cdd5a)
 
 Phase 4 is 7 modules, so it is built in slices, not all at once — this slice
 is the one that syncs directly with Phase 3 data. Remaining Phase 4 modules
