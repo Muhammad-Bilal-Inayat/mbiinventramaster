@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import { hashPassword, randomId } from "./security.js";
 import { plans, type PlanId } from "./catalog.js";
+import { ensureMasterTables } from "./store.js";
 
 // Phase 1: tenant provisioning for MariaDB only.
 // All database credentials come from environment variables on the server
@@ -56,6 +57,7 @@ function isValidDatabaseName(name: string): boolean {
 
 export async function provisionTenant(input: ProvisionInput): Promise<ProvisionResult> {
   if (!plans[input.plan]) throw new Error("INVALID_PLAN");
+  await ensureMasterTables();
   const masterPool = mariadb.createPool(mariadbConfig(process.env.MARIADB_DATABASE || "master_control"));
   let tenantPool: ReturnType<typeof mariadb.createPool> | null = null;
   try {

@@ -107,6 +107,40 @@ export function buildRouter(store: Store): Router {
   // is disabled entirely (503), never open. It only runs when
   // STORAGE_MODE=mariadb, because the memory demo has no real databases.
   // No database password is ever accepted in this request body.
+  // Phase 5 slice 1 — Master panel list. Same master-key gate as create,
+  // MariaDB only. The panel itself lives at /server in the frontend and is
+  // never linked from the login page or the tenant nav.
+  router.get("/api/master/tenants", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    if (process.env.STORAGE_MODE !== "mariadb") return response.status(503).json({ error: "STORAGE_NOT_MARIADB", message: "Tenant listing requires STORAGE_MODE=mariadb." });
+    try { return response.json({ tenants: await store.listTenants() }); } catch { return response.status(503).json({ error: "TENANT_DATABASE_NOT_FOUND" }); }
+  });
+
+  // Phase 5 slice 1 — Public registration. Owner decision after pushback:
+  // anyone may register a pharmacy, but the guardrails stay: plan is forced
+  // to Basic (Advanced is a master-panel upgrade, so public signups cannot
+  // burn Advanced AI quota), and registrations are rate-limited per IP
+  // (10 per hour) so the endpoint cannot be used to flood tenant databases.
+  const publicRegisterHits = new Map<string, number[]>();
+  router.post("/api/public/register", async (request, response) => {
+    if (process.env.STORAGE_MODE !== "mariadb") return response.status(503).json({ error: "STORAGE_NOT_MARIADB", message: "Public registration requires STORAGE_MODE=mariadb." });
+    const ip = request.ip || "unknown";
+    const now = Date.now();
+    const hits = (publicRegisterHits.get(ip) ?? []).filter((t) => now - t < 3600000);
+    if (hits.length >= 10) return response.status(429).json({ error: "RATE_LIMITED", message: "Too many registrations from this address. Try again later." });
+    hits.push(now); publicRegisterHits.set(ip, hits);
+    const body = z.object({ name: z.string().min(2).max(160), ownerName: z.string().min(2).max(160), ownerLogin: z.string().min(2).max(160), ownerPassword: z.string().min(8).max(200), branchName: z.string().min(2).max(160), branchCity: z.string().max(120).optional() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try {
+      const result = await provisionTenant({ ...body.data, plan: "basic" });
+      return response.status(201).json({ tenant: { id: result.tenantId, name: body.data.name, databaseName: result.databaseName, plan: "basic" }, ownerLogin: body.data.ownerLogin });
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "REGISTER_FAILED";
+      if (code === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: code });
+      return response.status(503).json({ error: "REGISTER_FAILED", message: "Registration failed. The database or provisioning step did not complete." });
+    }
+  });
+
   router.post("/api/master/tenants", async (request, response) => {
     const masterKey = process.env.MASTER_ADMIN_KEY;
     if (!masterKey) return response.status(503).json({ error: "MASTER_PROVISIONING_DISABLED", message: "Set MASTER_ADMIN_KEY in the server env to enable tenant provisioning." });

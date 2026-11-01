@@ -80,6 +80,31 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 5 slice 1: Auto-setup + Master panel + Public registration (local, not pushed yet)
+
+- Auto-setup: on MariaDB boot (and again before provisioning) the app
+  creates the registry tables itself (tenants, tenant_user_index,
+  tenant_devices, tenant_domains, master_audit_logs, schema_migrations),
+  additive only, in whatever database MARIADB_DATABASE points to. No
+  manual phpMyAdmin step is needed anymore. The old 003 file's hardcoded
+  USE master_control line was removed for the same reason.
+- Master panel: open `/server` by URL (never linked from login or tenant
+  nav). Enter the server-env master key — it stays in the browser
+  session only, never saved — then list tenants and create tenants
+  (Basic or Advanced) from the browser. GET /api/master/tenants is new;
+  POST /api/master/tenants is unchanged.
+- Public registration (owner decision after pushback): the login page
+  now has "Register a new pharmacy (Basic plan)". POST
+  /api/public/register creates a tenant + owner + branch with the same
+  provisioning code as the master panel, then the frontend logs the new
+  owner in automatically. Guardrails, stated plainly: plan is forced to
+  Basic (Advanced is a master-panel upgrade, so public signups cannot
+  burn Advanced AI quota), and registrations are rate-limited to 10 per
+  IP per hour (429 above that). No master key is needed for this route,
+  and it only runs in MariaDB mode (503 otherwise).
+- What did NOT change: login flow, tenant isolation, device limit, JWT,
+  and all Phase 2–4 menus.
+
 ## Phase 4 slice 4: Staff attendance + payroll (pushed, commit adb444c)
 
 Advanced only, same rule as slices 1–3. New permissions

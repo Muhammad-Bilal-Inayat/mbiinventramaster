@@ -5,7 +5,8 @@
 -- it is deliberately not mounted into /docker-entrypoint-initdb.d.
 -- The tenant_user_index rows themselves are created by tenant provisioning
 -- in Phase 1; this migration only creates the empty table + column.
-USE master_control;
+-- Run this file inside your registry database (the one in MARIADB_DATABASE).
+-- The old 'USE master_control' line was removed: it failed on any other DB name.
 
 CREATE TABLE IF NOT EXISTS tenant_user_index (
   user_id VARCHAR(96) PRIMARY KEY,

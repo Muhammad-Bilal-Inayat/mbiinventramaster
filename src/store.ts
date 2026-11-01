@@ -211,6 +211,7 @@ export interface DashboardRecord {
 export interface Store {
   findUser(login: string): Promise<UserRecord | undefined>;
   getTenant(tenantId: string): Promise<TenantRecord | undefined>;
+  listTenants(): Promise<Array<{ id: string; name: string; plan: string; status: string; databaseName: string }>>;
   getUser(userId: string): Promise<UserRecord | undefined>;
   listDevices(tenantId: string): Promise<DeviceRecord[]>;
   registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">): Promise<DeviceRecord>;
@@ -310,6 +311,7 @@ class MemoryStore implements Store {
   }
   async findUser(login: string) { return [...this.users.values()].find((user) => user.login === login || user.id === login); }
   async getTenant(tenantId: string) { return this.tenants.get(tenantId); }
+  async listTenants() { return [...this.tenants.values()].map((t) => ({ id: t.id, name: t.name, plan: t.plan, status: t.status, databaseName: t.id })); }
   async getUser(userId: string) { return this.users.get(userId); }
   async listDevices(tenantId: string) { return [...this.devices.values()].filter((device) => device.tenantId === tenantId); }
   async registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">) {
@@ -919,6 +921,10 @@ class MariaDbHealthStore implements Store {
     const rows = await this.pool.query("SELECT id, name, plan, status, branch_summary_json AS branchSummary FROM tenants WHERE id = ? LIMIT 1", [tenantId]) as any[];
     const row = rows[0]; if (!row) return undefined;
     return { id: row.id, name: row.name, plan: row.plan, status: row.status, branches: typeof row.branchSummary === "string" ? JSON.parse(row.branchSummary || "[]") : (row.branchSummary || []) } as TenantRecord;
+  }
+  async listTenants() {
+    const rows = await this.pool.query("SELECT id, name, plan, status, database_name AS databaseName FROM tenants ORDER BY created_at DESC LIMIT 200") as any[];
+    return rows.map((r: any) => ({ id: r.id, name: r.name, plan: r.plan, status: r.status, databaseName: r.databaseName }));
   }
   async getUser(userId: string) {
     const rows = await this.pool.query("SELECT user_id AS id, tenant_id AS tenantId, name, login, password_hash AS passwordHash, role, branch_ids_json AS branchIds, permissions_json AS permissions, active FROM tenant_user_index WHERE user_id = ? LIMIT 1", [userId]) as any[];
@@ -1719,8 +1725,30 @@ class MariaDbHealthStore implements Store {
   }
 }
 
+// Phase 5 slice 1 — auto-setup: on MariaDB boot the app creates the
+// registry tables itself (additive only, IF NOT EXISTS, never DROP), so
+// no manual phpMyAdmin step is needed. The registry is whatever database
+// MARIADB_DATABASE points to — never a hardcoded name, which is why the
+// old 001/003 files with USE master_control failed on other DB names.
+export async function ensureMasterTables(): Promise<void> {
+  const pool = mariadb.createPool({ host: process.env.MARIADB_HOST, port: Number(process.env.MARIADB_PORT || 3306), user: process.env.MARIADB_USER, password: process.env.MARIADB_PASSWORD, database: process.env.MARIADB_DATABASE, connectionLimit: 5 });
+  try {
+    await pool.query("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(64) PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB");
+    await pool.query("CREATE TABLE IF NOT EXISTS tenants (id VARCHAR(64) PRIMARY KEY, name VARCHAR(160) NOT NULL, database_name VARCHAR(96) NOT NULL UNIQUE, plan ENUM('basic','advanced') NOT NULL DEFAULT 'basic', status ENUM('active','locked','maintenance','archived') NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB");
+    const col = await pool.query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenants' AND COLUMN_NAME = 'branch_summary_json'") as any[];
+    if (!Number(col[0]?.n ?? 0)) await pool.query("ALTER TABLE tenants ADD COLUMN branch_summary_json JSON NULL");
+    await pool.query("CREATE TABLE IF NOT EXISTS tenant_domains (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL, hostname VARCHAR(255) NOT NULL UNIQUE, verified_at TIMESTAMP NULL, FOREIGN KEY (tenant_id) REFERENCES tenants(id)) ENGINE=InnoDB");
+    await pool.query("CREATE TABLE IF NOT EXISTS tenant_devices (id VARCHAR(96) PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL, user_id VARCHAR(96) NOT NULL, device_name VARCHAR(120) NOT NULL, hwid_hash CHAR(64) NOT NULL, public_key TEXT NULL, status ENUM('active','pending','revoked','frozen') NOT NULL DEFAULT 'pending', last_seen_at TIMESTAMP NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (tenant_id) REFERENCES tenants(id), INDEX idx_device_tenant_status (tenant_id, status)) ENGINE=InnoDB");
+    await pool.query("CREATE TABLE IF NOT EXISTS master_audit_logs (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, actor_id VARCHAR(96) NOT NULL, action VARCHAR(96) NOT NULL, tenant_id VARCHAR(64) NULL, metadata_json JSON NULL, ip_address VARCHAR(64) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_master_audit_tenant_time (tenant_id, created_at)) ENGINE=InnoDB");
+    await pool.query("CREATE TABLE IF NOT EXISTS tenant_user_index (user_id VARCHAR(96) PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL, name VARCHAR(160) NOT NULL, login VARCHAR(160) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL, role VARCHAR(80) NOT NULL, branch_ids_json JSON NOT NULL, permissions_json JSON NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_tenant_user_index_tenant (tenant_id)) ENGINE=InnoDB");
+  } finally { await pool.end().catch(() => undefined); }
+}
+
 export async function createStore(): Promise<Store> {
   const store = process.env.STORAGE_MODE === "mariadb" ? new MariaDbHealthStore() : new MemoryStore();
   if (store instanceof MemoryStore) await store.seed();
+  if (store instanceof MariaDbHealthStore) {
+    try { await ensureMasterTables(); } catch (error) { console.warn("Master auto-setup failed (will retry on next provisioning attempt):", error instanceof Error ? error.message : error); }
+  }
   return store;
 }
