@@ -2,6 +2,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { z } from "zod";
 import { allPermissionCodes, plans } from "./catalog.js";
 import { signAccessToken, verifyAccessToken, verifyPassword, type AccessClaims, deviceFingerprint } from "./security.js";
+import { provisionTenant } from "./provision.js";
 import type { Store } from "./store.js";
 
 export interface RequestContext extends Request { auth?: AccessClaims; }
@@ -84,6 +85,45 @@ export function buildRouter(store: Store): Router {
     const tenant = await store.getTenant(user.tenantId); if (!tenant) return response.status(500).json({ error: "DEMO_NOT_READY" });
     const token = signAccessToken({ sub: user.id, tenantId: tenant.id, deviceId: "device_demo", plan: tenant.plan, branchIds: user.branchIds, permissions: user.permissions });
     response.json({ token });
+  });
+
+  // Phase 1: Master Admin tenant provisioning. This is NOT a tenant route
+  // and it does NOT use a tenant JWT. It is gated only by MASTER_ADMIN_KEY,
+  // which must be set in the server env. If the key is missing, provisioning
+  // is disabled entirely (503), never open. It only runs when
+  // STORAGE_MODE=mariadb, because the memory demo has no real databases.
+  // No database password is ever accepted in this request body.
+  router.post("/api/master/tenants", async (request, response) => {
+    const masterKey = process.env.MASTER_ADMIN_KEY;
+    if (!masterKey) return response.status(503).json({ error: "MASTER_PROVISIONING_DISABLED", message: "Set MASTER_ADMIN_KEY in the server env to enable tenant provisioning." });
+    const provided = request.header("x-master-key") || "";
+    const keysMatch = provided.length === masterKey.length && (() => {
+      let diff = 0;
+      for (let i = 0; i < provided.length; i++) diff |= provided.charCodeAt(i) ^ masterKey.charCodeAt(i);
+      return diff === 0;
+    })();
+    if (!keysMatch) return response.status(403).json({ error: "MASTER_KEY_INVALID" });
+    if (process.env.STORAGE_MODE !== "mariadb") return response.status(503).json({ error: "STORAGE_NOT_MARIADB", message: "Tenant provisioning requires STORAGE_MODE=mariadb." });
+    const body = z.object({
+      name: z.string().min(2).max(160),
+      plan: z.enum(["basic", "advanced"]),
+      ownerName: z.string().min(2).max(160),
+      ownerLogin: z.string().min(2).max(160),
+      ownerPassword: z.string().min(8).max(200),
+      branchName: z.string().min(2).max(160),
+      branchCity: z.string().max(120).optional(),
+    }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try {
+      const result = await provisionTenant(body.data);
+      return response.status(201).json({ tenant: { id: result.tenantId, name: body.data.name, databaseName: result.databaseName, plan: body.data.plan }, ownerUserId: result.ownerUserId, branchId: result.branchId });
+    } catch (error) {
+      // Never leak database error details (host, user, or SQL) to the client.
+      const message = error instanceof Error ? error.message : "PROVISION_FAILED";
+      if (message === "TENANT_ALREADY_EXISTS") return response.status(409).json({ error: message });
+      if (message === "INVALID_PLAN") return response.status(400).json({ error: message });
+      return response.status(503).json({ error: "PROVISION_FAILED", message: "Tenant provisioning failed. Check the server database configuration and try again." });
+    }
   });
 
   router.use("/api", requireAuth, tenantGuard(store));

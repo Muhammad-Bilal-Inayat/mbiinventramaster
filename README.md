@@ -49,6 +49,29 @@ CORS rule (Phase 0): no origin is reflected in production. Set `CORS_ORIGIN` to 
 - MariaDB tenant provisioning: `db/migrations/003_mariadb_index.sql` creates the empty `tenant_user_index` table and `tenants.branch_summary_json` column that the MariaDB store queries. Inserting tenant/user rows into that index is Phase 1 provisioning work, not done in Phase 0.
 - MariaDB dashboard: in MariaDB mode the dashboard returns zeros until real reporting queries land in Phase 2/3. Demo dashboard numbers exist only in memory mode and must never be shown as production data.
 
+## Phase 1: tenant provisioning (MariaDB only)
+
+POST /api/master/tenants creates a tenant the safe way:
+
+- Header: `x-master-key` must equal the server env `MASTER_ADMIN_KEY`.
+  If that env is unset, the route returns 503 and provisioning is disabled.
+- Body: tenant name, plan (basic/advanced), owner name/login/password
+  (min 8), branch name/city. No database name, no database password in the body.
+- The server generates the database name (tenant_000001, tenant_000002, ...),
+  creates that database, applies `db/migrations/002_tenant_template.sql`
+  inside it only, seeds one branch + one Owner + owner permissions, then
+  writes the master `tenants` row and the `tenant_user_index` row last.
+- If provisioning fails after CREATE DATABASE, the new database is left
+  in place and reported, never auto-dropped.
+- Database credentials always come from the server env
+  (MARIADB_HOST / MARIADB_USER / MARIADB_PASSWORD). They are never put in
+  Git, never in a request, and never in chat. A password that was ever
+  shared in chat must be changed in the hosting panel first, then updated
+  in the server env — the old value must not be reused for a live test.
+- `Host: localhost` means the database is only reachable from the server
+  that hosts the site itself. A live MariaDB test therefore has to run on
+  that server after deploy, not from a different machine.
+
 ## Git release
 
 ```bash
