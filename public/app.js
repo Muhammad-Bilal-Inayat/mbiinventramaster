@@ -56,7 +56,7 @@ function dashboardHTML() {
 }
 
 function appShell() {
-  return `<div class="shell"><aside class="rail"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><div class="rail-label">Workspace</div>${navItem('Overview','home',true)}${navItem('Sales / POS','sales')}${navItem('Inventory','inventory')}${navItem('Purchases','purchases')}${navItem('Prescriptions','prescriptions')}${navItem('Attendance','attendance')}<div class="rail-label">Control room</div>${navItem('Reports','report')}${navItem('Branches','branch')}${navItem('Devices','device')}${navItem('Sync health','sync')}<div class="rail-label">System</div>${navItem('Settings','settings')}<div class="profile"><div class="avatar">${state.me.user.name.split(' ').map(x => x[0]).join('').slice(0,2)}</div><div><strong>${state.me.user.name}</strong><span>${state.me.user.role}</span></div></div></aside><main class="main" id="mainContent">${dashboardHTML()}</main><div class="toast" id="toast"></div><button id="aiButton" class="ai-button" title="MBI AI Assistant"><img src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"> AI</button><div id="aiPanel" class="ai-panel" style="display:none"><div class="ai-head"><img src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><strong>MBI AI Assistant</strong><span id="aiCreditsText"></span><button id="aiClose" class="btn ghost">X</button></div><div id="aiMessages" class="ai-messages"><div class="ai-msg ai-bot">Hi, I am your MBI pharmacy assistant. Ask about this tenant's branches and dashboard summary. I only use this tenant's data.</div></div><form id="aiForm" class="ai-form"><input id="aiInput" placeholder="Ask about your pharmacy..." maxlength="2000" required /><button class="btn primary" type="submit">Send</button></form></div></div>`;
+  return `<div class="shell"><aside class="rail"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><div class="rail-label">Workspace</div>${navItem('Overview','home',true)}${navItem('Sales / POS','sales')}${navItem('Inventory','inventory')}${navItem('Purchases','purchases')}${navItem('Prescriptions','prescriptions')}${navItem('Attendance','attendance')}${navItem('Online Orders','orders')}<div class="rail-label">Control room</div>${navItem('Reports','report')}${navItem('Branches','branch')}${navItem('Devices','device')}${navItem('Sync health','sync')}<div class="rail-label">System</div>${navItem('Settings','settings')}<div class="profile"><div class="avatar">${state.me.user.name.split(' ').map(x => x[0]).join('').slice(0,2)}</div><div><strong>${state.me.user.name}</strong><span>${state.me.user.role}</span></div></div></aside><main class="main" id="mainContent">${dashboardHTML()}</main><div class="toast" id="toast"></div><button id="aiButton" class="ai-button" title="MBI AI Assistant"><img src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"> AI</button><div id="aiPanel" class="ai-panel" style="display:none"><div class="ai-head"><img src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><strong>MBI AI Assistant</strong><span id="aiCreditsText"></span><button id="aiClose" class="btn ghost">X</button></div><div id="aiMessages" class="ai-messages"><div class="ai-msg ai-bot">Hi, I am your MBI pharmacy assistant. Ask about this tenant's branches and dashboard summary. I only use this tenant's data.</div></div><form id="aiForm" class="ai-form"><input id="aiInput" placeholder="Ask about your pharmacy..." maxlength="2000" required /><button class="btn primary" type="submit">Send</button></form></div></div>`;
 }
 
 async function renderApp() {
@@ -160,6 +160,32 @@ async function renderAttendance() {
   document.querySelector('#payLoad').addEventListener('click', async () => { const month = document.querySelector('#payMonth').value; if (!month) return alert('Select a month.'); try { const data = await api('/api/payroll?month=' + month); document.querySelector('#payList').innerHTML = data.payroll.map(r => '<div class="activity"><div><strong>' + r.userId + '</strong><span>' + r.daysPresent + ' days present - ' + r.totalHours + ' hrs - Salary ' + r.monthlySalary + ' - Pay ' + r.pay + '</span></div></div>').join('') || '<p>No attendance in this month.</p>'; } catch (e) { alert(e.message); } });
   document.querySelector('#salaryForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); try { await api('/api/staff/' + f.userId + '/salary', { method: 'POST', body: JSON.stringify({ monthlySalary: Number(f.monthlySalary) }) }); alert('Salary saved.'); } catch (err) { alert(err.message); } });
   loadAtt();
+}
+
+
+async function renderOrders() {
+  const storeUrl = window.location.origin + '/store/' + state.me.tenant.id;
+  document.querySelector('#mainContent').innerHTML =
+    '<div class="topbar"><div><div class="eyebrow">ONLINE STORE — ADVANCED ONLY</div><h1 class="headline">Online orders</h1><p class="subhead">Ye tenant ke apne online store ka sara data hai: har order, us ke items, customer aur status. Confirm par stock FEFO se katta hai, reject par kuch nahi katta, delivered sirf status hai. Online totals POS sales totals me nahi milte — ye alag channel hai, taake koi menu double-count na kare. Payment cash on delivery / pickup hai, is slice me online payment nahi hai.</p></div></div>' +
+    '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">Public store link</h2></div><p>Customers isi link par order dete hain, bina login ke: <strong>' + storeUrl + '</strong></p><p style="font-size:12px;color:#627d98">Controlled medicines online store me kabhi nahi dikhti, kyunki anonymous customer prescription nahi de sakta.</p></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Orders</h2></div><div id="orderTotals" style="margin-bottom:12px"></div><div id="orderList"><p>Loading...</p></div></section>';
+  async function loadOrders() {
+    try {
+      const data = await api('/api/orders');
+      const pending = data.orders.filter(o => o.status === 'pending');
+      const confirmed = data.orders.filter(o => o.status === 'confirmed');
+      const delivered = data.orders.filter(o => o.status === 'delivered');
+      const sum = (arr) => arr.reduce((s, o) => s + o.total, 0);
+      document.querySelector('#orderTotals').innerHTML = '<p>Pending: ' + pending.length + ' - Confirmed total: ' + money(sum(confirmed)) + ' - Delivered total: ' + money(sum(delivered)) + ' - Rejected: ' + data.orders.filter(o => o.status === 'rejected').length + '</p>';
+      const box = document.querySelector('#orderList');
+      if (!data.orders.length) { box.innerHTML = '<p>No online orders yet.</p>'; return; }
+      box.innerHTML = data.orders.map(o => '<div class="activity"><div><strong>' + o.orderNo + ' - ' + money(o.total) + ' - ' + o.status.toUpperCase() + '</strong><span>' + o.customerName + ' (' + o.customerPhone + ') - Branch ' + o.branchId + ' - Items: ' + o.items.map(i => i.medicineName + ' x' + i.quantity + ' @ Rs. ' + i.unitPrice).join(', ') + '</span></div>' + (o.status === 'pending' ? '<div style="display:flex;gap:8px"><button class="btn primary" data-order-confirm="' + o.id + '">Confirm (deduct stock)</button><button class="btn" data-order-reject="' + o.id + '">Reject</button></div>' : o.status === 'confirmed' ? '<button class="btn primary" data-order-deliver="' + o.id + '">Mark delivered</button>' : '<span>' + o.id + '</span>') + '</div>').join('');
+      box.querySelectorAll('[data-order-confirm]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/orders/' + btn.dataset.orderConfirm + '/confirm', { method: 'POST' }); loadOrders(); } catch (err) { alert(err.message); } }));
+      box.querySelectorAll('[data-order-reject]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/orders/' + btn.dataset.orderReject + '/reject', { method: 'POST' }); loadOrders(); } catch (err) { alert(err.message); } }));
+      box.querySelectorAll('[data-order-deliver]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/orders/' + btn.dataset.orderDeliver + '/deliver', { method: 'POST' }); loadOrders(); } catch (err) { alert(err.message); } }));
+    } catch (e) { document.querySelector('#orderList').innerHTML = '<p class="error">' + e.message + '</p>'; }
+  }
+  loadOrders();
 }
 
 async function renderSales() {
@@ -331,7 +357,7 @@ async function renderReports() {
 }
 
 function bindApp() {
-  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key === 'report') { renderReports(); } else if (key === 'prescriptions') { renderPrescriptions(); } else if (key === 'attendance') { renderAttendance(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
+  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key === 'report') { renderReports(); } else if (key === 'prescriptions') { renderPrescriptions(); } else if (key === 'attendance') { renderAttendance(); } else if (key === 'orders') { renderOrders(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
   document.querySelector('#refresh')?.addEventListener('click', async () => { state.dashboard = await api('/api/dashboard'); document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); const toast = document.querySelector('#toast'); toast.textContent = 'Dashboard refreshed.'; toast.style.display = 'block'; setTimeout(() => { toast.style.display = 'none'; }, 2600); });
   document.querySelector('#resetLayout')?.addEventListener('click', async () => { try { const r = await api('/api/home/layout', { method: 'POST', body: JSON.stringify({ layout: ["kpis", "branch", "alerts", "top", "activity", "command"] }) }); state.homeLayout = r.layout; document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); } catch (error) { alert(error.message); } });
   document.querySelectorAll('[data-widget]').forEach(el => {
@@ -376,6 +402,58 @@ function registerView(message = '') {
   document.querySelector('#registerForm').addEventListener('submit', async (event) => { event.preventDefault(); const body = Object.fromEntries(new FormData(event.currentTarget)); try { const data = await api('/api/public/register', { method: 'POST', body: JSON.stringify(body) }); const login = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ login: body.ownerLogin, password: body.ownerPassword, deviceName: 'Owner workstation' }) }); state.token = login.token; localStorage.setItem('mbi_token', state.token); await renderApp(); } catch (error) { registerView(error.message); } });
 }
 
+
+async function storeView(tenantId) {
+  document.querySelector('#app').innerHTML = `<main class="login"><section class="login-card" style="max-width:760px"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><h1 id="storeTitle">Online store</h1><div id="storeContent"><p>Loading store...</p></div></section></main>`;
+  const box = document.querySelector('#storeContent');
+  try {
+    const store = await api('/api/public/store/' + encodeURIComponent(tenantId));
+    document.querySelector('#storeTitle').textContent = store.store.name + ' — Online store';
+    box.innerHTML = '<p style="font-size:13px;color:#627d98">Bina login ke order karein. Payment cash on delivery / pickup hai. Controlled medicines yahan nahi milti.</p>' +
+      '<div style="margin:12px 0"><label>Branch</label><select id="storeBranch" style="width:100%;padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + store.store.branches.map(b => '<option value="' + b.id + '">' + b.name + (b.city ? ' — ' + b.city : '') + '</option>').join('') + '</select></div>' +
+      '<div id="storeProducts"><p>Loading products...</p></div>' +
+      '<div id="storeCart" style="margin-top:12px"></div>' +
+      '<form id="storeCheckout" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px"><input name="customerName" placeholder="Your name *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="customerPhone" placeholder="Phone *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="address" placeholder="Address (optional)" style="grid-column:1 / -1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Place order</button></form><div id="storeResult" style="margin-top:12px"></div>';
+    const cart = [];
+    function renderCart() {
+      const cb = document.querySelector('#storeCart'); if (!cb) return;
+      if (!cart.length) { cb.innerHTML = '<p>Cart is empty.</p>'; return; }
+      const total = cart.reduce((s, c) => s + c.quantity * c.unitPrice, 0);
+      cb.innerHTML = '<table class="table"><thead><tr><th>Medicine</th><th>Qty</th><th>Price</th><th></th></tr></thead><tbody>' + cart.map((c, i) => '<tr><td>' + c.name + '</td><td>' + c.quantity + '</td><td>Rs. ' + (c.quantity * c.unitPrice) + '</td><td><button class="btn" data-store-remove="' + i + '">Remove</button></td></tr>').join('') + '</tbody></table><p><strong>Total: Rs. ' + total + '</strong></p>';
+      cb.querySelectorAll('[data-store-remove]').forEach(btn => btn.addEventListener('click', () => { cart.splice(Number(btn.dataset.storeRemove), 1); renderCart(); }));
+    }
+    renderCart();
+    async function loadProducts() {
+      const branchId = document.querySelector('#storeBranch').value;
+      try {
+        const data = await api('/api/public/store/' + encodeURIComponent(tenantId) + '/products?branchId=' + encodeURIComponent(branchId));
+        const pb = document.querySelector('#storeProducts'); if (!pb) return;
+        if (!data.products.length) { pb.innerHTML = '<p>No medicines in stock at this branch right now.</p>'; return; }
+        pb.innerHTML = data.products.map(p => '<div class="activity"><div><strong>' + p.name + (p.strength ? ' ' + p.strength : '') + '</strong><span>Rs. ' + p.unitPrice + ' - In stock: ' + p.available + '</span></div><input type="number" min="1" max="' + p.available + '" value="1" data-store-qty="' + p.medicineId + '" style="width:70px;padding:8px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" data-store-add="' + p.medicineId + '" data-store-name="' + p.name + '" data-store-price="' + p.unitPrice + '" data-store-max="' + p.available + '">Add</button></div>').join('');
+        pb.querySelectorAll('[data-store-add]').forEach(btn => btn.addEventListener('click', () => {
+          const qtyEl = pb.querySelector('[data-store-qty="' + btn.dataset.storeAdd + '"]');
+          const qty = Number(qtyEl ? qtyEl.value : 1);
+          if (!(qty > 0)) return alert('Quantity must be positive.');
+          if (qty > Number(btn.dataset.storeMax)) return alert('Only ' + btn.dataset.storeMax + ' in stock at this branch.');
+          const existing = cart.find(c => c.medicineId === btn.dataset.storeAdd); if (existing) existing.quantity += qty; else cart.push({ medicineId: btn.dataset.storeAdd, name: btn.dataset.storeName, quantity: qty, unitPrice: Number(btn.dataset.storePrice) });
+          renderCart();
+        }));
+      } catch (e) { const pb = document.querySelector('#storeProducts'); if (pb) pb.innerHTML = '<p class="error">' + e.message + '</p>'; }
+    }
+    document.querySelector('#storeBranch').addEventListener('change', () => { cart.length = 0; renderCart(); loadProducts(); });
+    document.querySelector('#storeCheckout').addEventListener('submit', async (e) => {
+      e.preventDefault(); if (!cart.length) return alert('Cart is empty.');
+      const f = Object.fromEntries(new FormData(e.target));
+      try {
+        const data = await api('/api/public/store/' + encodeURIComponent(tenantId) + '/orders', { method: 'POST', body: JSON.stringify({ branchId: document.querySelector('#storeBranch').value, customerName: f.customerName, customerPhone: f.customerPhone, address: f.address || null, items: cart.map(c => ({ medicineId: c.medicineId, quantity: c.quantity })) }) });
+        document.querySelector('#storeResult').innerHTML = '<p>Order placed! Your order number is <strong>' + data.order.orderNo + '</strong> — total Rs. ' + data.order.total + '. The pharmacy will confirm it shortly.</p>';
+        cart.length = 0; renderCart(); loadProducts();
+      } catch (err) { alert(err.message); }
+    });
+    loadProducts();
+  } catch (e) { box.innerHTML = '<p class="error">' + e.message + '</p>'; }
+}
+
 function masterPanelView() {
   document.querySelector('#app').innerHTML = `<main class="login"><section class="login-card" style="max-width:720px"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><h1>Master panel</h1><p>Controls all tenants. This page is not linked anywhere — only you open it by URL. Your master key stays in this browser session only and is never saved.</p><form id="masterKeyForm" style="display:flex;gap:8px"><input id="masterKey" type="password" placeholder="Master key (server env)" required style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Unlock panel</button></form><div id="masterContent" style="margin-top:16px"></div></section></main>`;
   document.querySelector('#masterKeyForm').addEventListener('submit', (e) => { e.preventDefault(); sessionStorage.setItem('mbi_master_key', document.querySelector('#masterKey').value); loadMaster(); });
@@ -383,12 +461,13 @@ function masterPanelView() {
     const key = sessionStorage.getItem('mbi_master_key'); if (!key) return;
     try {
       const data = await api('/api/master/tenants', { headers: { 'x-master-key': key } });
-      document.querySelector('#masterContent').innerHTML = '<h3>Tenants (' + data.tenants.length + ')</h3>' + (data.tenants.map(t => '<div class="activity"><div><strong>' + t.name + '</strong><span>' + t.id + ' - ' + t.plan + ' - ' + t.status + ' - DB ' + t.databaseName + '</span></div></div>').join('') || '<p>No tenants yet.</p>') +
+      document.querySelector('#masterContent').innerHTML = '<h3>Tenants (' + data.tenants.length + ')</h3><p style="font-size:12px;color:#627d98">Master panel sirf tenants ko control karta hai — tenant ka business data (orders, sales, inventory) yahan kabhi nahi dikhta, wo sirf us tenant ke owner ke paas hota hai.</p>' + (data.tenants.map(t => '<div class="activity"><div><strong>' + t.name + '</strong><span>' + t.id + ' - ' + t.plan + ' - ' + t.status + ' - DB ' + t.databaseName + '</span></div><button class="btn" data-store-toggle="' + t.id + '" data-store-enabled="' + ((t.features && t.features.onlineStore === false) ? '1' : '0') + '">Online store: ' + ((t.features && t.features.onlineStore === false) ? 'OFF — turn on' : 'ON — turn off') + '</button></div>').join('') || '<p>No tenants yet.</p>') +
         '<h3 style="margin-top:16px">Create tenant</h3><form id="masterTenantForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="name" placeholder="Pharmacy name *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select name="plan" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="basic">Basic</option><option value="advanced">Advanced</option></select><input name="ownerName" placeholder="Owner name *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="ownerLogin" placeholder="Owner login *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="ownerPassword" type="password" placeholder="Owner password (min 8) *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="branchName" placeholder="Branch name *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Create tenant</button></form><div id="masterResult" style="margin-top:12px"></div>';
+      document.querySelectorAll('[data-store-toggle]').forEach(btn => btn.addEventListener('click', async () => { try { await api('/api/master/tenants/' + btn.dataset.storeToggle + '/features', { method: 'POST', headers: { 'x-master-key': key }, body: JSON.stringify({ feature: 'online_store', enabled: btn.dataset.storeEnabled === '1' }) }); loadMaster(); } catch (err) { alert(err.message); } }));
       document.querySelector('#masterTenantForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); try { const created = await api('/api/master/tenants', { method: 'POST', headers: { 'x-master-key': key }, body: JSON.stringify(f) }); document.querySelector('#masterResult').innerHTML = '<p>Tenant created: ' + created.tenant.id + '. Owner login: ' + f.ownerLogin + '</p>'; loadMaster(); } catch (err) { document.querySelector('#masterResult').innerHTML = '<p class="error">' + err.message + '</p>'; } });
     } catch (err) { document.querySelector('#masterContent').innerHTML = '<p class="error">' + err.message + '</p>'; }
   }
   if (sessionStorage.getItem('mbi_master_key')) loadMaster();
 }
 
-if (window.location.pathname === '/server') masterPanelView(); else if (window.location.pathname === '/register') registerView(); else if (state.token) renderApp(); else loginView();
+if (window.location.pathname === '/server') masterPanelView(); else if (window.location.pathname === '/register') registerView(); else if (window.location.pathname.startsWith('/store/')) storeView(window.location.pathname.slice(7)); else if (state.token) renderApp(); else loginView();

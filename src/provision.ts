@@ -94,7 +94,7 @@ export async function provisionTenant(input: ProvisionInput): Promise<ProvisionR
       "inventory.view", "inventory.edit", "inventory.adjust",
       "purchases.view", "purchases.create", "purchases.approve",
       "parties.view", "parties.payment", "reports.view", "reports.export",
-      "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "payroll.view", "accounting.view",
+      "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "payroll.view", "accounting.view", "orders.view", "orders.manage",
       "admin.users", "admin.devices",
     ];
     await tenantPool.query(

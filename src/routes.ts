@@ -141,6 +141,79 @@ export function buildRouter(store: Store): Router {
     }
   });
 
+  // Phase 4 slice 5 — Public storefront + master feature control.
+  // Public store routes are NOT tenant-JWT routes: the tenant comes from
+  // the URL path, and the server checks that tenant's plan, status and
+  // master feature flag itself. No customer login exists, no payment is
+  // taken here (cash on delivery / pickup only), and controlled medicines
+  // are never listed — an anonymous customer cannot present a prescription.
+  async function publicStoreTenant(tenantId: string, response: Response) {
+    let tenant;
+    try { tenant = await store.getPublicStore(tenantId); } catch { response.status(404).json({ error: "TENANT_NOT_FOUND" }); return null; }
+    if (tenant.status !== "active") { response.status(423).json({ error: "TENANT_UNAVAILABLE" }); return null; }
+    if (tenant.plan !== "advanced") { response.status(403).json({ error: "PLAN_NOT_ADVANCED", message: "Online store is available on the Advanced plan only." }); return null; }
+    if (!tenant.onlineStoreEnabled) { response.status(403).json({ error: "STORE_DISABLED", message: "This pharmacy's online store is turned off by the master panel." }); return null; }
+    return tenant;
+  }
+  router.get("/api/public/store/:tenantId", async (request, response) => {
+    const tenant = await publicStoreTenant(String(request.params.tenantId), response);
+    if (!tenant) return;
+    return response.json({ store: { id: tenant.id, name: tenant.name, branches: tenant.branches } });
+  });
+  router.get("/api/public/store/:tenantId/products", async (request, response) => {
+    const tenant = await publicStoreTenant(String(request.params.tenantId), response);
+    if (!tenant) return;
+    const branchId = typeof request.query.branchId === "string" ? request.query.branchId : "";
+    if (!branchId) return response.status(400).json({ error: "BRANCH_REQUIRED" });
+    try { return response.json({ products: await store.getPublicStoreProducts(tenant.id, branchId) }); } catch (error) {
+      const code = error instanceof Error ? error.message : "STORE_FAILED";
+      if (code === "BRANCH_NOT_FOUND") return response.status(404).json({ error: code });
+      return response.status(503).json({ error: "STORE_FAILED" });
+    }
+  });
+  const publicOrderHits = new Map<string, number[]>();
+  router.post("/api/public/store/:tenantId/orders", async (request, response) => {
+    const tenant = await publicStoreTenant(String(request.params.tenantId), response);
+    if (!tenant) return;
+    const ip = request.ip || "unknown";
+    const now = Date.now();
+    const hits = (publicOrderHits.get(ip) ?? []).filter((t) => now - t < 3600000);
+    if (hits.length >= 30) return response.status(429).json({ error: "RATE_LIMITED", message: "Too many orders from this address. Try again later." });
+    hits.push(now); publicOrderHits.set(ip, hits);
+    const body = z.object({ branchId: z.string().min(1), customerName: z.string().min(2).max(160), customerPhone: z.string().min(7).max(40), address: z.string().max(400).nullable().optional(), items: z.array(z.object({ medicineId: z.string().min(1), quantity: z.number().int().positive() })).min(1).max(50) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    try { return response.status(201).json({ order: await store.createOnlineOrder(tenant.id, body.data) }); } catch (error) {
+      const code = error instanceof Error ? error.message : "ORDER_FAILED";
+      const map: Record<string, number> = { MEDICINE_NOT_FOUND: 404, BRANCH_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_ITEMS: 400, TENANT_DATABASE_NOT_FOUND: 503 };
+      return response.status(map[code] ?? 500).json({ error: code, message: code === "INSUFFICIENT_STOCK" ? "Some items do not have enough stock in this branch right now." : "Order could not be placed." });
+    }
+  });
+
+  // Master feature control (user order): /server only controls tenants —
+  // one flag per function per tenant. Today only "online_store" exists;
+  // other menus reuse this endpoint when their controls are set later.
+  // This endpoint never returns tenant business data (no orders, sales or
+  // inventory), only the tenant's own feature flags.
+  router.get("/api/master/tenants/:tenantId/features", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try { return response.json({ tenantId: String(request.params.tenantId), features: await store.getTenantFeatures(String(request.params.tenantId)) }); } catch (error) {
+      const code = error instanceof Error ? error.message : "FEATURE_FAILED";
+      if (code === "TENANT_NOT_FOUND") return response.status(404).json({ error: code });
+      return response.status(503).json({ error: "FEATURE_FAILED" });
+    }
+  });
+  router.post("/api/master/tenants/:tenantId/features", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ feature: z.string().min(1), enabled: z.boolean() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    try { return response.json({ tenantId: String(request.params.tenantId), features: await store.setTenantFeature(String(request.params.tenantId), body.data.feature, body.data.enabled) }); } catch (error) {
+      const code = error instanceof Error ? error.message : "FEATURE_FAILED";
+      if (code === "TENANT_NOT_FOUND") return response.status(404).json({ error: code });
+      if (code === "FEATURE_NOT_SUPPORTED") return response.status(400).json({ error: code, message: "Only the online_store feature flag exists today." });
+      return response.status(503).json({ error: "FEATURE_FAILED" });
+    }
+  });
+
   router.post("/api/master/tenants", async (request, response) => {
     const masterKey = process.env.MASTER_ADMIN_KEY;
     if (!masterKey) return response.status(503).json({ error: "MASTER_PROVISIONING_DISABLED", message: "Set MASTER_ADMIN_KEY in the server env to enable tenant provisioning." });
@@ -531,6 +604,50 @@ export function buildRouter(store: Store): Router {
   router.get("/api/controlled-log", requirePermission("prescriptions.view"), async (request: RequestContext, response) => {
     if (!requireAdvanced(request, response)) return;
     return response.json({ logs: await store.listControlledLogs(request.auth!.tenantId) });
+  });
+
+  // Phase 4 slice 5 — Tenant owner's online orders. The owner (and staff
+  // with orders permissions) sees ALL of this tenant's online store data
+  // here — every order, its items, customer and status — and confirms,
+  // rejects or delivers it. Confirm deducts FEFO stock in one transaction;
+  // reject moves no stock; delivered is a status change only. Online
+  // totals are a separate channel from POS sales totals and are never
+  // added into dashboard/POS revenue, so the menus cannot double-count.
+  function mapSlice5Error(error: unknown, response: Response) {
+    const code = error instanceof Error ? error.message : "SLICE5_ERROR";
+    const map: Record<string, number> = { ORDER_NOT_FOUND: 404, MEDICINE_NOT_FOUND: 404, BRANCH_NOT_FOUND: 404, INSUFFICIENT_STOCK: 400, INVALID_ITEMS: 400, ORDER_NOT_PENDING: 409, ORDER_NOT_CONFIRMED: 409, TENANT_DATABASE_NOT_FOUND: 503 };
+    return response.status(map[code] ?? 500).json({ error: code, message: code === "ORDER_NOT_PENDING" ? "This order is no longer pending." : code === "ORDER_NOT_CONFIRMED" ? "Only a confirmed order can be delivered." : code === "INSUFFICIENT_STOCK" ? "Not enough stock in this branch to confirm this order." : "Online order operation failed." });
+  }
+  router.get("/api/orders", requirePermission("orders.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    return response.json({ orders: await store.listOnlineOrders(request.auth!.tenantId) });
+  });
+  router.get("/api/orders/:id", requirePermission("orders.view"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const order = await store.getOnlineOrder(request.auth!.tenantId, String(request.params.id));
+    if (!order) return response.status(404).json({ error: "ORDER_NOT_FOUND" });
+    return response.json({ order });
+  });
+  router.post("/api/orders/:id/confirm", requirePermission("orders.manage"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const existing = await store.getOnlineOrder(request.auth!.tenantId, String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "ORDER_NOT_FOUND" });
+    if (!branchAccess(request, existing.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ order: await store.confirmOnlineOrder(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapSlice5Error(error, response); }
+  });
+  router.post("/api/orders/:id/reject", requirePermission("orders.manage"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const existing = await store.getOnlineOrder(request.auth!.tenantId, String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "ORDER_NOT_FOUND" });
+    if (!branchAccess(request, existing.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ order: await store.rejectOnlineOrder(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapSlice5Error(error, response); }
+  });
+  router.post("/api/orders/:id/deliver", requirePermission("orders.manage"), async (request: RequestContext, response) => {
+    if (!requireAdvanced(request, response)) return;
+    const existing = await store.getOnlineOrder(request.auth!.tenantId, String(request.params.id));
+    if (!existing) return response.status(404).json({ error: "ORDER_NOT_FOUND" });
+    if (!branchAccess(request, existing.branchId)) return response.status(403).json({ error: "BRANCH_ACCESS_DENIED" });
+    try { return response.json({ order: await store.deliverOnlineOrder(request.auth!.tenantId, request.auth!.sub, String(request.params.id)) }); } catch (error) { return mapSlice5Error(error, response); }
   });
 
   // Phase 4 slice 2 — Accounting, Advanced only. No separate stored ledger:

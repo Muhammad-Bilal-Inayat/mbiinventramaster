@@ -24,6 +24,8 @@ export type PermissionCode =
   | "attendance.view"
   | "attendance.mark"
   | "payroll.view"
+  | "orders.view"
+  | "orders.manage"
   | "accounting.view"
   | "admin.users"
   | "admin.devices";
@@ -93,6 +95,8 @@ export const permissionLabels: Record<PermissionCode, string> = {
   "prescriptions.dispense": "Dispense prescription",
   "attendance.view": "View attendance",
   "attendance.mark": "Mark attendance",
+  "orders.view": "View online orders",
+  "orders.manage": "Manage online orders",
   "payroll.view": "View payroll",
   "accounting.view": "View accounting",
   "admin.users": "Manage users",

@@ -156,6 +156,11 @@ export interface TransferRecord {
   createdAt: string;
 }
 
+export interface PublicStoreProduct { medicineId: string; name: string; strength: string | null; dosageForm: string | null; unitPrice: number; available: number; }
+export interface OnlineOrderItemRecord { medicineId: string; medicineName: string; quantity: number; unitPrice: number; }
+export interface OnlineOrderRecord { id: string; orderNo: string; branchId: string; customerName: string; customerPhone: string; address: string | null; status: "pending" | "confirmed" | "rejected" | "delivered"; total: number; items: OnlineOrderItemRecord[]; createdAt: string; }
+export interface OnlineOrderInput { branchId: string; customerName: string; customerPhone: string; address?: string | null; items: Array<{ medicineId: string; quantity: number }>; }
+
 export interface KhataEntryRecord {
   id: string;
   partyId: string;
@@ -211,7 +216,7 @@ export interface DashboardRecord {
 export interface Store {
   findUser(login: string): Promise<UserRecord | undefined>;
   getTenant(tenantId: string): Promise<TenantRecord | undefined>;
-  listTenants(): Promise<Array<{ id: string; name: string; plan: string; status: string; databaseName: string }>>;
+  listTenants(): Promise<Array<{ id: string; name: string; plan: string; status: string; databaseName: string; features: { onlineStore: boolean } }>>;
   getUser(userId: string): Promise<UserRecord | undefined>;
   listDevices(tenantId: string): Promise<DeviceRecord[]>;
   registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">): Promise<DeviceRecord>;
@@ -259,15 +264,25 @@ export interface Store {
   listAttendance(tenantId: string, filters: { userId?: string; branchId?: string; date?: string }): Promise<AttendanceRecord[]>;
   setStaffSalary(tenantId: string, userId: string, monthlySalary: number): Promise<{ userId: string; monthlySalary: number }>;
   getPayroll(tenantId: string, month: string): Promise<PayrollRow[]>;
+  getTenantFeatures(tenantId: string): Promise<{ onlineStore: boolean }>;
+  setTenantFeature(tenantId: string, feature: string, enabled: boolean): Promise<{ onlineStore: boolean }>;
+  getPublicStore(tenantId: string): Promise<{ id: string; name: string; plan: PlanId; status: string; branches: Array<{ id: string; name: string; city: string }>; onlineStoreEnabled: boolean }>;
+  getPublicStoreProducts(tenantId: string, branchId: string): Promise<PublicStoreProduct[]>;
+  createOnlineOrder(tenantId: string, input: OnlineOrderInput): Promise<OnlineOrderRecord>;
+  listOnlineOrders(tenantId: string): Promise<OnlineOrderRecord[]>;
+  getOnlineOrder(tenantId: string, orderId: string): Promise<OnlineOrderRecord | undefined>;
+  confirmOnlineOrder(tenantId: string, userId: string, orderId: string): Promise<OnlineOrderRecord>;
+  rejectOnlineOrder(tenantId: string, userId: string, orderId: string): Promise<OnlineOrderRecord>;
+  deliverOnlineOrder(tenantId: string, userId: string, orderId: string): Promise<OnlineOrderRecord>;
 }
 
 const ownerPermissions: PermissionCode[] = [
   "dashboard.view", "sales.view", "sales.create", "sales.refund", "sales.discount", "inventory.view", "inventory.edit", "inventory.adjust",
   "purchases.view", "purchases.create", "purchases.approve", "parties.view", "parties.payment", "reports.view", "reports.export",
-  "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "payroll.view", "accounting.view", "admin.users", "admin.devices",
+  "transfers.request", "transfers.approve", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "payroll.view", "accounting.view", "orders.view", "orders.manage", "admin.users", "admin.devices",
 ];
 const managerPermissions = ownerPermissions.filter((permission) => !["admin.users", "accounting.view"].includes(permission));
-const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark"];
+const pharmacistPermissions: PermissionCode[] = ["dashboard.view", "sales.view", "sales.create", "inventory.view", "inventory.edit", "purchases.view", "purchases.create", "parties.view", "prescriptions.view", "prescriptions.create", "prescriptions.dispense", "attendance.view", "attendance.mark", "orders.view", "orders.manage"];
 
 class MemoryStore implements Store {
   private tenants = new Map<string, TenantRecord>();
@@ -311,7 +326,7 @@ class MemoryStore implements Store {
   }
   async findUser(login: string) { return [...this.users.values()].find((user) => user.login === login || user.id === login); }
   async getTenant(tenantId: string) { return this.tenants.get(tenantId); }
-  async listTenants() { return [...this.tenants.values()].map((t) => ({ id: t.id, name: t.name, plan: t.plan, status: t.status, databaseName: t.id })); }
+  async listTenants() { return [...this.tenants.values()].map((t) => ({ id: t.id, name: t.name, plan: t.plan, status: t.status, databaseName: t.id, features: { onlineStore: this.tenantFeatures.get(t.id)?.onlineStore ?? true } })); }
   async getUser(userId: string) { return this.users.get(userId); }
   async listDevices(tenantId: string) { return [...this.devices.values()].filter((device) => device.tenantId === tenantId); }
   async registerDevice(input: Omit<DeviceRecord, "id" | "lastSeen" | "status">) {
@@ -723,6 +738,136 @@ class MemoryStore implements Store {
     if (!sale || sale.tenantId !== tenantId) return undefined;
     return this.saleToRecord(sale);
   }
+  // Phase 4 slice 5 — Online store (Advanced only). Public storefront
+  // products exclude controlled medicines: an anonymous customer cannot
+  // present a prescription, so controlled stock is never sold online.
+  // Order placement checks stock but does NOT deduct it; confirm deducts
+  // FEFO in one pre-checked pass; reject moves nothing; delivered is a
+  // status change only. Confirmed/delivered online totals are a separate
+  // channel from POS sales totals — they are shown on the Orders page and
+  // never mixed into dashboard/POS revenue, so no menu can double-count.
+  private onlineOrders = new Map<string, OnlineOrderRecord & { tenantId: string }>();
+  private onlineOrderSeq = new Map<string, number>();
+  private tenantFeatures = new Map<string, { onlineStore: boolean }>();
+  async getTenantFeatures(tenantId: string) {
+    return { ...(this.tenantFeatures.get(tenantId) ?? { onlineStore: true }) };
+  }
+  async setTenantFeature(tenantId: string, feature: string, enabled: boolean) {
+    if (feature !== "online_store") throw new Error("FEATURE_NOT_SUPPORTED");
+    const tenant = this.tenants.get(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    this.tenantFeatures.set(tenantId, { onlineStore: enabled });
+    return { onlineStore: enabled };
+  }
+  private onlineProductPrice(tenantId: string, medicineId: string, branchId: string): { unitPrice: number; available: number } | undefined {
+    const today = new Date().toISOString().slice(0, 10);
+    const candidates = [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === medicineId && b.expiryDate >= today).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+    let available = 0; let unitPrice: number | undefined;
+    for (const batch of candidates) {
+      const qty = this.stock.get(`${branchId}:${batch.id}`)?.quantity ?? 0;
+      if (qty <= 0) continue;
+      if (unitPrice === undefined) unitPrice = batch.salePrice;
+      available += qty;
+    }
+    if (unitPrice === undefined) return undefined;
+    return { unitPrice, available };
+  }
+  async getPublicStore(tenantId: string) {
+    const tenant = this.tenants.get(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    return { id: tenant.id, name: tenant.name, plan: tenant.plan, status: tenant.status, branches: tenant.branches.map((b) => ({ ...b })), onlineStoreEnabled: (await this.getTenantFeatures(tenantId)).onlineStore };
+  }
+  async getPublicStoreProducts(tenantId: string, branchId: string) {
+    const tenant = this.tenants.get(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    if (!tenant.branches.some((b) => b.id === branchId)) throw new Error("BRANCH_NOT_FOUND");
+    const out: PublicStoreProduct[] = [];
+    for (const med of [...this.medicines.values()].filter((m) => m.tenantId === tenantId && m.active && !m.isControlled).sort((a, b) => a.name.localeCompare(b.name))) {
+      const priced = this.onlineProductPrice(tenantId, med.id, branchId);
+      if (!priced || priced.available <= 0) continue;
+      out.push({ medicineId: med.id, name: med.name, strength: med.strength, dosageForm: med.dosageForm, unitPrice: priced.unitPrice, available: priced.available });
+    }
+    return out;
+  }
+  async createOnlineOrder(tenantId: string, input: OnlineOrderInput) {
+    const tenant = this.tenants.get(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    if (!tenant.branches.some((b) => b.id === input.branchId)) throw new Error("BRANCH_NOT_FOUND");
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    const merged = new Map<string, number>();
+    for (const item of input.items) {
+      if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+      merged.set(item.medicineId, (merged.get(item.medicineId) ?? 0) + item.quantity);
+    }
+    const items: OnlineOrderItemRecord[] = [];
+    for (const [medicineId, quantity] of merged) {
+      const med = this.medicines.get(medicineId);
+      if (!med || med.tenantId !== tenantId || !med.active || med.isControlled) throw new Error("MEDICINE_NOT_FOUND");
+      const priced = this.onlineProductPrice(tenantId, medicineId, input.branchId);
+      if (!priced || priced.available < quantity) throw new Error("INSUFFICIENT_STOCK");
+      items.push({ medicineId, medicineName: med.name, quantity, unitPrice: priced.unitPrice });
+    }
+    const total = items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
+    const seq = (this.onlineOrderSeq.get(tenantId) ?? 0) + 1;
+    this.onlineOrderSeq.set(tenantId, seq);
+    const order: OnlineOrderRecord & { tenantId: string } = { id: randomId("order"), tenantId, orderNo: "ORD-" + String(seq).padStart(6, "0"), branchId: input.branchId, customerName: input.customerName, customerPhone: input.customerPhone, address: input.address ?? null, status: "pending", total, items, createdAt: new Date().toISOString() };
+    this.onlineOrders.set(order.id, order);
+    return this.onlineOrderToRecord(order);
+  }
+  async listOnlineOrders(tenantId: string) {
+    return [...this.onlineOrders.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => this.onlineOrderToRecord(x));
+  }
+  async getOnlineOrder(tenantId: string, orderId: string) {
+    const order = this.onlineOrders.get(orderId);
+    if (!order || order.tenantId !== tenantId) return undefined;
+    return this.onlineOrderToRecord(order);
+  }
+  async confirmOnlineOrder(tenantId: string, userId: string, orderId: string) {
+    const order = this.onlineOrders.get(orderId);
+    if (!order || order.tenantId !== tenantId) throw new Error("ORDER_NOT_FOUND");
+    if (order.status !== "pending") throw new Error("ORDER_NOT_PENDING");
+    const today = new Date().toISOString().slice(0, 10);
+    const allocations: Array<{ medicineId: string; batchId: string; quantity: number }> = [];
+    for (const item of order.items) {
+      let remaining = item.quantity;
+      const candidates = [...this.batches.values()].filter((b) => b.tenantId === tenantId && b.medicineId === item.medicineId && b.expiryDate >= today).sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+      for (const batch of candidates) {
+        if (remaining <= 0) break;
+        const row = this.stock.get(`${order.branchId}:${batch.id}`);
+        const avail = row?.quantity ?? 0;
+        if (avail <= 0) continue;
+        const take = Math.min(remaining, avail);
+        allocations.push({ medicineId: item.medicineId, batchId: batch.id, quantity: take });
+        remaining -= take;
+      }
+      if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+    }
+    for (const a of allocations) {
+      const key = `${order.branchId}:${a.batchId}`;
+      const row = this.stock.get(key)!; row.quantity -= a.quantity; this.stock.set(key, row);
+      this.movementSeq += 1;
+      this.movements.push({ id: randomId("movement"), branchId: order.branchId, batchId: a.batchId, movementType: "online_order", quantity: -a.quantity, referenceId: order.id, idempotencyKey: `online-order-${order.id}-${a.batchId}`, serverVersion: this.movementSeq });
+    }
+    order.status = "confirmed";
+    return this.onlineOrderToRecord(order);
+  }
+  async rejectOnlineOrder(tenantId: string, _userId: string, orderId: string) {
+    const order = this.onlineOrders.get(orderId);
+    if (!order || order.tenantId !== tenantId) throw new Error("ORDER_NOT_FOUND");
+    if (order.status !== "pending") throw new Error("ORDER_NOT_PENDING");
+    order.status = "rejected";
+    return this.onlineOrderToRecord(order);
+  }
+  async deliverOnlineOrder(tenantId: string, _userId: string, orderId: string) {
+    const order = this.onlineOrders.get(orderId);
+    if (!order || order.tenantId !== tenantId) throw new Error("ORDER_NOT_FOUND");
+    if (order.status !== "confirmed") throw new Error("ORDER_NOT_CONFIRMED");
+    order.status = "delivered";
+    return this.onlineOrderToRecord(order);
+  }
+  private onlineOrderToRecord(order: OnlineOrderRecord & { tenantId: string }): OnlineOrderRecord {
+    const { tenantId: _t, ...rest } = order; return { ...rest, items: rest.items.map((i) => ({ ...i })) };
+  }
   async listSales(tenantId: string) {
     return [...this.sales.values()].filter((x) => x.tenantId === tenantId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((x) => this.saleToRecord(x));
   }
@@ -923,8 +1068,9 @@ class MariaDbHealthStore implements Store {
     return { id: row.id, name: row.name, plan: row.plan, status: row.status, branches: typeof row.branchSummary === "string" ? JSON.parse(row.branchSummary || "[]") : (row.branchSummary || []) } as TenantRecord;
   }
   async listTenants() {
-    const rows = await this.pool.query("SELECT id, name, plan, status, database_name AS databaseName FROM tenants ORDER BY created_at DESC LIMIT 200") as any[];
-    return rows.map((r: any) => ({ id: r.id, name: r.name, plan: r.plan, status: r.status, databaseName: r.databaseName }));
+    await this.ensureTenantFeatureColumn();
+    const rows = await this.pool.query("SELECT id, name, plan, status, database_name AS databaseName, feature_flags_json AS featureFlags FROM tenants ORDER BY created_at DESC LIMIT 200") as any[];
+    return rows.map((r: any) => ({ id: r.id, name: r.name, plan: r.plan, status: r.status, databaseName: r.databaseName, features: this.parseTenantFeatures(r.featureFlags) }));
   }
   async getUser(userId: string) {
     const rows = await this.pool.query("SELECT user_id AS id, tenant_id AS tenantId, name, login, password_hash AS passwordHash, role, branch_ids_json AS branchIds, permissions_json AS permissions, active FROM tenant_user_index WHERE user_id = ? LIMIT 1", [userId]) as any[];
@@ -1603,6 +1749,171 @@ class MariaDbHealthStore implements Store {
   private async ensurePhase4Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
     await tenantPool.query("CREATE TABLE IF NOT EXISTS transfers (id VARCHAR(96) PRIMARY KEY, medicine_id VARCHAR(96) NOT NULL, batch_id VARCHAR(96) NOT NULL, batch_no VARCHAR(96) NOT NULL, from_branch_id VARCHAR(96) NOT NULL, to_branch_id VARCHAR(96) NOT NULL, quantity INT NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'pending', created_by VARCHAR(96) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_transfer_status (status)) ENGINE=InnoDB");
   }
+  // Phase 4 slice 5 — MariaDB online store + master feature flags.
+  // Master control rule (user order): /server only ever controls tenants
+  // (list, create, per-tenant feature toggles). It never reads tenant
+  // business data — orders, sales and inventory stay inside the tenant's
+  // own database and are visible only to that tenant's owner and staff.
+  // Feature flags are one flag per function per tenant, stored as JSON on
+  // the master tenants row; today only "online_store" exists, more flags
+  // reuse this same mechanism when the user sets controls later. Default
+  // is ON, so existing tenants lose nothing when this ships.
+  private async ensurePhase4Slice5Tables(tenantPool: ReturnType<typeof mariadb.createPool>) {
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS online_orders (id VARCHAR(96) PRIMARY KEY, order_no VARCHAR(64) NOT NULL UNIQUE, branch_id VARCHAR(96) NOT NULL, customer_name VARCHAR(220) NOT NULL, customer_phone VARCHAR(60) NOT NULL, address VARCHAR(400) NULL, status VARCHAR(30) NOT NULL DEFAULT 'pending', total DECIMAL(14,2) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_online_order_status (status)) ENGINE=InnoDB");
+    await tenantPool.query("CREATE TABLE IF NOT EXISTS online_order_items (order_id VARCHAR(96) NOT NULL, medicine_id VARCHAR(96) NOT NULL, medicine_name VARCHAR(220) NOT NULL, quantity INT NOT NULL, unit_price DECIMAL(14,2) NOT NULL, PRIMARY KEY (order_id, medicine_id)) ENGINE=InnoDB");
+  }
+  private async ensureTenantFeatureColumn() {
+    const col = await this.pool.query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenants' AND COLUMN_NAME = 'feature_flags_json'") as any[];
+    if (!Number(col[0]?.n ?? 0)) await this.pool.query("ALTER TABLE tenants ADD COLUMN feature_flags_json JSON NULL");
+  }
+  private parseTenantFeatures(raw: unknown): { onlineStore: boolean } {
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (parsed && typeof parsed === "object" && "onlineStore" in parsed) return { onlineStore: (parsed as any).onlineStore !== false };
+    } catch { /* fall through to default ON */ }
+    return { onlineStore: true };
+  }
+  async getTenantFeatures(tenantId: string) {
+    await this.ensureTenantFeatureColumn();
+    const rows = await this.pool.query("SELECT feature_flags_json AS featureFlags FROM tenants WHERE id = ? LIMIT 1", [tenantId]) as any[];
+    if (!rows.length) throw new Error("TENANT_NOT_FOUND");
+    return this.parseTenantFeatures(rows[0].featureFlags);
+  }
+  async setTenantFeature(tenantId: string, feature: string, enabled: boolean) {
+    if (feature !== "online_store") throw new Error("FEATURE_NOT_SUPPORTED");
+    await this.ensureTenantFeatureColumn();
+    const rows = await this.pool.query("SELECT id FROM tenants WHERE id = ? LIMIT 1", [tenantId]) as any[];
+    if (!rows.length) throw new Error("TENANT_NOT_FOUND");
+    await this.pool.query("UPDATE tenants SET feature_flags_json = ? WHERE id = ?", [JSON.stringify({ onlineStore: enabled }), tenantId]);
+    await this.pool.query("INSERT INTO master_audit_logs (actor_id, action, tenant_id, metadata_json) VALUES (?, 'tenant.feature', ?, ?)", ["master", tenantId, JSON.stringify({ feature, enabled })]);
+    return { onlineStore: enabled };
+  }
+  async getPublicStore(tenantId: string) {
+    const tenant = await this.getTenant(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    return { id: tenant.id, name: tenant.name, plan: tenant.plan, status: tenant.status, branches: tenant.branches, onlineStoreEnabled: (await this.getTenantFeatures(tenantId)).onlineStore };
+  }
+  async getPublicStoreProducts(tenantId: string, branchId: string) {
+    const tenant = await this.getTenant(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    if (!tenant.branches.some((b: any) => b.id === branchId)) throw new Error("BRANCH_NOT_FOUND");
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Slice3Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT m.id AS medicineId, m.name, m.strength, m.dosage_form AS dosageForm, b.sale_price AS salePrice, b.expiry_date AS expiryDate, bs.quantity FROM medicines m JOIN medicine_batches b ON b.medicine_id = m.id JOIN branch_stock bs ON bs.batch_id = b.id WHERE m.active = TRUE AND COALESCE(m.is_controlled, FALSE) = FALSE AND bs.branch_id = ? AND bs.quantity > 0 AND b.expiry_date >= CURDATE() ORDER BY m.name, b.expiry_date", [branchId]) as any[];
+    const byMedicine = new Map<string, PublicStoreProduct>();
+    for (const r of rows) {
+      const existing = byMedicine.get(r.medicineId);
+      if (existing) { existing.available += Number(r.quantity); continue; }
+      byMedicine.set(r.medicineId, { medicineId: r.medicineId, name: r.name, strength: r.strength, dosageForm: r.dosageForm, unitPrice: Number(r.salePrice), available: Number(r.quantity) });
+    }
+    return [...byMedicine.values()];
+  }
+  private async loadOnlineOrder(poolOrConn: any, orderId: string): Promise<OnlineOrderRecord | undefined> {
+    const rows = await poolOrConn.query("SELECT id, order_no AS orderNo, branch_id AS branchId, customer_name AS customerName, customer_phone AS customerPhone, address, status, total, created_at AS createdAt FROM online_orders WHERE id = ? LIMIT 1", [orderId]) as any[];
+    const r = rows[0]; if (!r) return undefined;
+    const itemRows = await poolOrConn.query("SELECT medicine_id AS medicineId, medicine_name AS medicineName, quantity, unit_price AS unitPrice FROM online_order_items WHERE order_id = ?", [orderId]) as any[];
+    return { id: r.id, orderNo: r.orderNo, branchId: r.branchId, customerName: r.customerName, customerPhone: r.customerPhone, address: r.address, status: r.status, total: Number(r.total), items: itemRows.map((i: any) => ({ medicineId: i.medicineId, medicineName: i.medicineName, quantity: Number(i.quantity), unitPrice: Number(i.unitPrice) })), createdAt: String(r.createdAt) };
+  }
+  async createOnlineOrder(tenantId: string, input: OnlineOrderInput) {
+    const tenant = await this.getTenant(tenantId);
+    if (!tenant) throw new Error("TENANT_NOT_FOUND");
+    if (!tenant.branches.some((b: any) => b.id === input.branchId)) throw new Error("BRANCH_NOT_FOUND");
+    if (!input.items.length) throw new Error("INVALID_ITEMS");
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Slice3Tables(tenantPool); await this.ensurePhase4Slice5Tables(tenantPool);
+    const merged = new Map<string, number>();
+    for (const item of input.items) {
+      if (!(item.quantity > 0)) throw new Error("INVALID_ITEMS");
+      merged.set(item.medicineId, (merged.get(item.medicineId) ?? 0) + item.quantity);
+    }
+    const items: OnlineOrderItemRecord[] = [];
+    for (const [medicineId, quantity] of merged) {
+      const medRows = await tenantPool.query("SELECT id, name, active, COALESCE(is_controlled, FALSE) AS isControlled FROM medicines WHERE id = ? LIMIT 1", [medicineId]) as any[];
+      const med = medRows[0];
+      if (!med || !med.active || med.isControlled) throw new Error("MEDICINE_NOT_FOUND");
+      const batchRows = await tenantPool.query("SELECT b.sale_price AS salePrice, bs.quantity FROM medicine_batches b JOIN branch_stock bs ON bs.batch_id = b.id WHERE b.medicine_id = ? AND bs.branch_id = ? AND bs.quantity > 0 AND b.expiry_date >= CURDATE() ORDER BY b.expiry_date", [medicineId, input.branchId]) as any[];
+      const available = batchRows.reduce((sum: number, r: any) => sum + Number(r.quantity), 0);
+      if (!batchRows.length || available < quantity) throw new Error("INSUFFICIENT_STOCK");
+      items.push({ medicineId, medicineName: med.name, quantity, unitPrice: Number(batchRows[0].salePrice) });
+    }
+    const total = items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
+    const orderId = randomId("order");
+    const countRows = await tenantPool.query("SELECT COUNT(*) AS n FROM online_orders") as any[];
+    let orderNo = "ORD-" + String(Number(countRows[0]?.n ?? 0) + 1).padStart(6, "0");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await tenantPool.query("INSERT INTO online_orders (id, order_no, branch_id, customer_name, customer_phone, address, status, total) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)", [orderId, orderNo, input.branchId, input.customerName, input.customerPhone, input.address ?? null, total]);
+        break;
+      } catch (e: any) {
+        if (String(e?.code) === "ER_DUP_ENTRY" && attempt < 2) { orderNo = "ORD-" + String(Number(countRows[0]?.n ?? 0) + 2 + attempt).padStart(6, "0"); continue; }
+        throw e;
+      }
+    }
+    for (const item of items) await tenantPool.query("INSERT INTO online_order_items (order_id, medicine_id, medicine_name, quantity, unit_price) VALUES (?, ?, ?, ?, ?)", [orderId, item.medicineId, item.medicineName, item.quantity, item.unitPrice]);
+    return (await this.loadOnlineOrder(tenantPool, orderId))!;
+  }
+  async listOnlineOrders(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice5Tables(tenantPool);
+    const rows = await tenantPool.query("SELECT id FROM online_orders ORDER BY created_at DESC LIMIT 200") as any[];
+    const out: OnlineOrderRecord[] = [];
+    for (const r of rows) { const o = await this.loadOnlineOrder(tenantPool, r.id); if (o) out.push(o); }
+    return out;
+  }
+  async getOnlineOrder(tenantId: string, orderId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice5Tables(tenantPool);
+    return this.loadOnlineOrder(tenantPool, orderId);
+  }
+  async confirmOnlineOrder(tenantId: string, userId: string, orderId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool); await this.ensurePhase4Slice5Tables(tenantPool);
+    const connection = await tenantPool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const order = await this.loadOnlineOrder(connection, orderId);
+      if (!order) throw new Error("ORDER_NOT_FOUND");
+      if (order.status !== "pending") throw new Error("ORDER_NOT_PENDING");
+      for (const item of order.items) {
+        let remaining = item.quantity;
+        const batchRows = await connection.query("SELECT b.id AS batchId, bs.quantity FROM medicine_batches b JOIN branch_stock bs ON bs.batch_id = b.id WHERE b.medicine_id = ? AND bs.branch_id = ? AND bs.quantity > 0 AND b.expiry_date >= CURDATE() ORDER BY b.expiry_date FOR UPDATE", [item.medicineId, order.branchId]) as any[];
+        for (const batch of batchRows) {
+          if (remaining <= 0) break;
+          const take = Math.min(remaining, Number(batch.quantity));
+          await connection.query("UPDATE branch_stock SET quantity = quantity - ? WHERE branch_id = ? AND batch_id = ?", [take, order.branchId, batch.batchId]);
+          await connection.query("INSERT INTO stock_movements (movement_uuid, branch_id, batch_id, movement_type, quantity, reference_id, idempotency_key, server_version, created_by) VALUES (?, ?, ?, 'online_order', ?, ?, ?, 0, ?)", [randomId("movement"), order.branchId, batch.batchId, -take, orderId, `online-order-${orderId}-${batch.batchId}`, userId]);
+          remaining -= take;
+        }
+        if (remaining > 0) throw new Error("INSUFFICIENT_STOCK");
+      }
+      await connection.query("UPDATE online_orders SET status = 'confirmed' WHERE id = ?", [orderId]);
+      await connection.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'online_order.confirm', 'online_order', ?, ?)", [userId, orderId, JSON.stringify({ status: "confirmed" })]);
+      await connection.commit();
+      return (await this.loadOnlineOrder(tenantPool, orderId))!;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined); throw error;
+    } finally { connection.release(); }
+  }
+  async rejectOnlineOrder(tenantId: string, userId: string, orderId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice5Tables(tenantPool);
+    const order = await this.loadOnlineOrder(tenantPool, orderId);
+    if (!order) throw new Error("ORDER_NOT_FOUND");
+    if (order.status !== "pending") throw new Error("ORDER_NOT_PENDING");
+    await tenantPool.query("UPDATE online_orders SET status = 'rejected' WHERE id = ?", [orderId]);
+    await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'online_order.reject', 'online_order', ?, ?)", [userId, orderId, JSON.stringify({ status: "rejected" })]);
+    return (await this.loadOnlineOrder(tenantPool, orderId))!;
+  }
+  async deliverOnlineOrder(tenantId: string, userId: string, orderId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensurePhase4Slice5Tables(tenantPool);
+    const order = await this.loadOnlineOrder(tenantPool, orderId);
+    if (!order) throw new Error("ORDER_NOT_FOUND");
+    if (order.status !== "confirmed") throw new Error("ORDER_NOT_CONFIRMED");
+    await tenantPool.query("UPDATE online_orders SET status = 'delivered' WHERE id = ?", [orderId]);
+    await tenantPool.query("INSERT INTO audit_logs (actor_id, action, entity, entity_id, after_json) VALUES (?, 'online_order.deliver', 'online_order', ?, ?)", [userId, orderId, JSON.stringify({ status: "delivered" })]);
+    return (await this.loadOnlineOrder(tenantPool, orderId))!;
+  }
   async getSalesReport(tenantId: string, filters: { from?: string; to?: string; branchId?: string }): Promise<SalesReport> {
     const tenantPool = await this.getTenantPool(tenantId);
     await this.ensureInventoryTables(tenantPool); await this.ensurePhase3Tables(tenantPool);
@@ -1737,6 +2048,8 @@ export async function ensureMasterTables(): Promise<void> {
     await pool.query("CREATE TABLE IF NOT EXISTS tenants (id VARCHAR(64) PRIMARY KEY, name VARCHAR(160) NOT NULL, database_name VARCHAR(96) NOT NULL UNIQUE, plan ENUM('basic','advanced') NOT NULL DEFAULT 'basic', status ENUM('active','locked','maintenance','archived') NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB");
     const col = await pool.query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenants' AND COLUMN_NAME = 'branch_summary_json'") as any[];
     if (!Number(col[0]?.n ?? 0)) await pool.query("ALTER TABLE tenants ADD COLUMN branch_summary_json JSON NULL");
+    const featCol = await pool.query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenants' AND COLUMN_NAME = 'feature_flags_json'") as any[];
+    if (!Number(featCol[0]?.n ?? 0)) await pool.query("ALTER TABLE tenants ADD COLUMN feature_flags_json JSON NULL");
     await pool.query("CREATE TABLE IF NOT EXISTS tenant_domains (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL, hostname VARCHAR(255) NOT NULL UNIQUE, verified_at TIMESTAMP NULL, FOREIGN KEY (tenant_id) REFERENCES tenants(id)) ENGINE=InnoDB");
     await pool.query("CREATE TABLE IF NOT EXISTS tenant_devices (id VARCHAR(96) PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL, user_id VARCHAR(96) NOT NULL, device_name VARCHAR(120) NOT NULL, hwid_hash CHAR(64) NOT NULL, public_key TEXT NULL, status ENUM('active','pending','revoked','frozen') NOT NULL DEFAULT 'pending', last_seen_at TIMESTAMP NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (tenant_id) REFERENCES tenants(id), INDEX idx_device_tenant_status (tenant_id, status)) ENGINE=InnoDB");
     await pool.query("CREATE TABLE IF NOT EXISTS master_audit_logs (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, actor_id VARCHAR(96) NOT NULL, action VARCHAR(96) NOT NULL, tenant_id VARCHAR(64) NULL, metadata_json JSON NULL, ip_address VARCHAR(64) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_master_audit_tenant_time (tenant_id, created_at)) ENGINE=InnoDB");

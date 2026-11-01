@@ -80,6 +80,44 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
+## Phase 4 slice 5: Online store + master per-tenant control (local, not pushed yet)
+
+Phase 4 is closed by this slice: the last Phase 4 module, Online store
+(Advanced only, already listed in the Advanced plan modules). New
+permissions orders.view / orders.manage (owner + manager + pharmacist;
+provisioned owners get them too).
+- Public storefront, no login: `/store/<tenantId>` — branch select, then
+  active, in-stock medicines at that branch at the FEFO batch price, cart,
+  and checkout (name, phone, address optional). Cash on delivery / pickup
+  only — no online payment in this slice. Controlled medicines are never
+  listed online, because an anonymous customer cannot present a
+  prescription. Public order placement is rate-limited to 30 per IP per
+  hour (429 above that).
+- Orders, tenant side only: the tenant owner (and staff with orders
+  permissions) sees ALL of this tenant's online store data on the Online
+  Orders page — every order, its items, customer and status — and confirms,
+  rejects or delivers it. Placement checks stock but deducts nothing.
+  Confirm deducts FEFO stock in one transaction (insufficient stock at
+  confirm time leaves the order pending, 400). Reject moves no stock.
+  Delivered is a status change only. Online totals are a separate channel
+  from POS sales totals and are never added into dashboard/POS revenue, so
+  the menus cannot double-count; stock, however, is one truth — a confirmed
+  order reduces the same branch stock the POS sees.
+- Master control (user order, 2026-11-01): `/server` only ever controls
+  tenants, never tenant business data. The panel now has one toggle per
+  tenant — Online store ON/OFF — backed by GET/POST
+  /api/master/tenants/:tenantId/features and a feature_flags_json column
+  on the master tenants row (additive, INFORMATION_SCHEMA-checked; missing
+  = ON, so existing tenants lose nothing). Only "online_store" exists
+  today; other per-function menus reuse this same endpoint when the user
+  sets controls later. Turning a store OFF blocks new public orders only;
+  existing pending orders stay visible and fulfillable. Staff order history
+  stays visible even when the store is OFF.
+- Migration 010 (tenant DB: online_orders + online_order_items) is a
+  reference copy; the app also creates these tables on demand.
+- What did NOT change: POS, inventory, khata, prescriptions, attendance,
+  master tenant list/create, public registration, login flow, device limit.
+
 ## Phase 5 slice 1: Auto-setup + Master panel + Public registration (pushed, commit 8da927c)
 
 - Auto-setup: on MariaDB boot (and again before provisioning) the app
