@@ -80,7 +80,7 @@ tree (commit SHA, parent, file count, key paths) and reset the local clone.
 - Tenant AI context is only that tenant's name, plan, branches and
   dashboard counts. No other tenant's data is ever sent to the AI.
 
-## Phase 3: POS, Purchases, Khata (local, not pushed yet)
+## Phase 3: POS, Purchases, Khata (pushed, commit 94c4fcf)
 
 - POS sale: POST /api/sales (permission sales.create, branch access).
   FEFO allocation across batches, invoice INV-000001 style, stock + movement
