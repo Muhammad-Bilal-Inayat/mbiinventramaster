@@ -1,4 +1,4 @@
-const state = { token: localStorage.getItem('mbi_token'), me: null, dashboard: null, homeLayout: null, aiCredits: null, draggedWidget: null };
+const state = { token: localStorage.getItem('mbi_token'), me: null, dashboard: null, homeLayout: null, aiCredits: null, draggedWidget: null, announcements: [] };
 const icon = { home:'⌂', sales:'▥', inventory:'▣', purchases:'↥', report:'▤', branch:'⌂', users:'♙', device:'◈', sync:'↻', settings:'⚙' };
 
 async function api(path, options = {}) {
@@ -49,10 +49,11 @@ function dashboardHTML() {
   for (const k of ["branch", "alerts", "top", "activity", "command"]) if (!gridOrder.includes(k)) gridOrder.push(k);
   const tenantLabel = state.me.tenant.id === 'tenant_demo' ? 'DEMO TENANT - PREVIEW DATA' : 'LIVE TENANT';
   const branchOptions = state.me.tenant.branches.map(b => '<option>' + b.name + '</option>').join('');
+  const annBanner = (state.announcements && state.announcements.length) ? '<section class="card panel" style="margin-bottom:16px">' + state.announcements.map(a => '<div class="activity"><div><strong>' + a.title + '</strong><span>' + a.body + '</span></div></div>').join('') + '</section>' : '';
   const topbar = '<div class="topbar"><div><div class="eyebrow">' + state.me.tenant.plan.toUpperCase() + ' PLAN - ' + tenantLabel + '</div><h1 class="headline">Good morning, ' + state.me.user.name.split(' ')[0] + '.</h1><p class="subhead">Here is what is happening across ' + state.me.tenant.branches.length + ' branches today.</p></div><div class="top-actions"><select class="selector"><option>All branches (' + state.me.tenant.branches.length + ')</option>' + branchOptions + '</select><button class="btn" id="resetLayout">Reset layout</button><button class="btn primary" id="refresh">Refresh dashboard</button></div></div>';
   const kpis = '<section class="kpis"><article class="card kpi"><div class="label">Total revenue</div><div class="value">' + money(s.revenue) + '</div></article><article class="card kpi"><div class="label">Net profit</div><div class="value">' + money(s.profit) + '</div></article><article class="card kpi warn"><div class="label">Low stock items</div><div class="value">' + s.lowStock + '</div><div class="trend">Needs purchase action</div></article><article class="card kpi alert"><div class="label">Expiring soon</div><div class="value">' + s.expiringSoon + '</div><div class="trend">Review expiring items</div></article></section>';
   const grid = '<section class="grid">' + gridOrder.map(key => widgetPanel(key, s)).join('') + '</section>';
-  return topbar + kpis + grid;
+  return annBanner + topbar + kpis + grid;
 }
 
 function appShell() {
@@ -62,6 +63,7 @@ function appShell() {
 async function renderApp() {
   try {
     state.me = await api('/api/me'); state.dashboard = await api('/api/dashboard');
+    try { const ann = await api('/api/announcements'); state.announcements = ann.announcements; } catch { state.announcements = []; }
     try { const l = await api('/api/home/layout'); state.homeLayout = l.layout; } catch { state.homeLayout = ["kpis", "branch", "alerts", "top", "activity", "command"]; }
     try { const c = await api('/api/ai/credits'); state.aiCredits = c.credits; } catch { state.aiCredits = null; }
     document.querySelector('#app').innerHTML = appShell(); bindApp();
@@ -455,14 +457,14 @@ async function storeView(tenantId) {
 }
 
 function masterPanelView() {
-  document.querySelector('#app').innerHTML = `<main class="login"><section class="login-card" style="max-width:860px"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><h1>Master panel</h1><p>Controls all tenants. This page is not linked anywhere — only you open it by URL. Your master key stays in this browser session only and is never saved.</p><form id="masterKeyForm" style="display:flex;gap:8px"><input id="masterKey" type="password" placeholder="Master key (server env)" required style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Unlock panel</button></form><div style="display:flex;gap:8px;margin-top:16px"><button class="btn primary" data-master-tab="tenants">Tenants</button><button class="btn" data-master-tab="licenses">Licenses</button><button class="btn" data-master-tab="devices">Devices</button><button class="btn" data-master-tab="health">System health</button><button class="btn" data-master-tab="domains">Domains</button><button class="btn" data-master-tab="notes">Support notes</button></div><div id="masterContent" style="margin-top:16px"></div></section></main>`;
+  document.querySelector('#app').innerHTML = `<main class="login"><section class="login-card" style="max-width:860px"><div class="brand"><img class="brand-logo" src="/assets/brand/MBI-LOGO.png" alt="MBI Inventra"><span>MBI <em>Inventra</em></span></div><h1>Master panel</h1><p>Controls all tenants. This page is not linked anywhere — only you open it by URL. Your master key stays in this browser session only and is never saved.</p><form id="masterKeyForm" style="display:flex;gap:8px"><input id="masterKey" type="password" placeholder="Master key (server env)" required style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" type="submit">Unlock panel</button></form><div style="display:flex;gap:8px;margin-top:16px"><button class="btn primary" data-master-tab="tenants">Tenants</button><button class="btn" data-master-tab="licenses">Licenses</button><button class="btn" data-master-tab="devices">Devices</button><button class="btn" data-master-tab="health">System health</button><button class="btn" data-master-tab="domains">Domains</button><button class="btn" data-master-tab="notes">Support notes</button><button class="btn" data-master-tab="subscriptions">Subscriptions</button><button class="btn" data-master-tab="announcements">Announcements</button><button class="btn" data-master-tab="backup">Backup</button></div><div id="masterContent" style="margin-top:16px"></div></section></main>`;
   let masterTab = 'tenants';
   document.querySelectorAll('[data-master-tab]').forEach(btn => btn.addEventListener('click', () => { masterTab = btn.dataset.masterTab; loadMasterTab(); }));
   document.querySelector('#masterKeyForm').addEventListener('submit', (e) => { e.preventDefault(); sessionStorage.setItem('mbi_master_key', document.querySelector('#masterKey').value); loadMasterTab(); });
   function mapi(path, options = {}) { const key = sessionStorage.getItem('mbi_master_key'); return api(path, { ...options, headers: { 'x-master-key': key, ...(options.headers || {}) } }); }
   async function loadMasterTab() {
     const key = sessionStorage.getItem('mbi_master_key'); if (!key) return;
-    try { if (masterTab === 'licenses') await renderLicenses(); else if (masterTab === 'devices') await renderDevices(); else if (masterTab === 'health') await renderHealth(); else if (masterTab === 'domains') await renderDomains(); else if (masterTab === 'notes') await renderNotes(); else await renderTenants(); } catch (err) { document.querySelector('#masterContent').innerHTML = '<p class="error">' + err.message + '</p>'; }
+    try { if (masterTab === 'licenses') await renderLicenses(); else if (masterTab === 'devices') await renderDevices(); else if (masterTab === 'health') await renderHealth(); else if (masterTab === 'domains') await renderDomains(); else if (masterTab === 'notes') await renderNotes(); else if (masterTab === 'subscriptions') await renderSubscriptions(); else if (masterTab === 'announcements') await renderMasterAnnouncements(); else if (masterTab === 'backup') await renderBackup(); else await renderTenants(); } catch (err) { document.querySelector('#masterContent').innerHTML = '<p class="error">' + err.message + '</p>'; }
   }
   async function renderTenants() {
     const data = await mapi('/api/master/tenants');
@@ -547,6 +549,37 @@ function masterPanelView() {
     document.querySelector('#noteLoad').addEventListener('click', async () => { const t = document.querySelector('#noteTenant').value.trim(); if (!t) return alert('Enter a tenant ID first.'); masterTenantId = t; try { const data = await mapi('/api/master/tenants/' + encodeURIComponent(t) + '/note'); document.querySelector('#noteText').value = data.note; } catch (err) { document.querySelector('#noteResult').innerHTML = '<p class="error">' + err.message + '</p>'; } });
     document.querySelector('#noteSave').addEventListener('click', async () => { const t = document.querySelector('#noteTenant').value.trim(); if (!t) return alert('Enter a tenant ID first.'); masterTenantId = t; try { await mapi('/api/master/tenants/' + encodeURIComponent(t) + '/note', { method: 'POST', body: JSON.stringify({ note: document.querySelector('#noteText').value }) }); document.querySelector('#noteResult').innerHTML = '<p>Note saved.</p>'; } catch (err) { document.querySelector('#noteResult').innerHTML = '<p class="error">' + err.message + '</p>'; } });
     if (tenantId) document.querySelector('#noteLoad').click();
+  }
+
+  async function renderSubscriptions() {
+    const data = await mapi('/api/master/subscriptions');
+    document.querySelector('#masterContent').innerHTML = '<h3>Subscriptions</h3><p style="font-size:12px;color:#627d98">Derived from each tenant plan and license. No billing is processed here — payment collection is not built.</p>' +
+      (data.subscriptions.map(s => '<div class="activity"><div><strong>' + s.tenantName + ' — ' + s.plan.toUpperCase() + '</strong><span>Tenant ' + s.tenantId + ' - Status ' + s.status + ' - License: ' + (s.license ? s.license.effectiveStatus.toUpperCase() + ' (' + s.license.key + ')' + (s.license.lifetime ? ' - lifetime' : (s.license.expiryDate ? ' - expires ' + s.license.expiryDate : '')) : 'none — tenant works normally') + ' - Payment collection: not built</span></div></div>').join('') || '<p>No tenants yet.</p>');
+  }
+  async function renderMasterAnnouncements() {
+    const data = await mapi('/api/master/announcements');
+    document.querySelector('#masterContent').innerHTML = '<h3>Announcements</h3><p style="font-size:12px;color:#627d98">Announcements with no tenant ID are shown to every tenant on their dashboard. A tenant-targeted announcement is only shown to that tenant.</p>' +
+      '<div id="annList">' + (data.announcements.map(a => '<div class="activity"><div><strong>' + a.title + ' — ' + (a.active ? 'ACTIVE' : 'INACTIVE') + '</strong><span>' + (a.tenantId ? 'Tenant ' + a.tenantId : 'All tenants') + ' - ' + a.body + '</span></div><button class="btn" data-ann-toggle="' + a.id + '" data-ann-active="' + (a.active ? '0' : '1') + '">' + (a.active ? 'Deactivate' : 'Activate') + '</button></div>').join('') || '<p>No announcements yet.</p>') + '</div>' +
+      '<h3 style="margin-top:16px">New announcement</h3><form id="annForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><input name="tenantId" placeholder="Tenant ID (optional — empty = all tenants)" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="title" placeholder="Title *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><textarea name="body" placeholder="Message *" required style="grid-column:1 / -1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" rows="3"></textarea><button class="btn primary" type="submit">Publish announcement</button></form><div id="annResult" style="margin-top:12px"></div>';
+    document.querySelectorAll('[data-ann-toggle]').forEach(b => b.addEventListener('click', async () => { try { await mapi('/api/master/announcements/' + b.dataset.annToggle + '/active', { method: 'POST', body: JSON.stringify({ active: b.dataset.annActive === '1' }) }); renderMasterAnnouncements(); } catch (err) { alert(err.message); } }));
+    document.querySelector('#annForm').addEventListener('submit', async (e) => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); try { await mapi('/api/master/announcements', { method: 'POST', body: JSON.stringify({ tenantId: f.tenantId || null, title: f.title, body: f.body }) }); renderMasterAnnouncements(); } catch (err) { document.querySelector('#annResult').innerHTML = '<p class="error">' + err.message + '</p>'; } });
+  }
+  async function renderBackup() {
+    document.querySelector('#masterContent').innerHTML = '<h3>Tenant backup</h3><p style="font-size:12px;color:#627d98">Export downloads one tenant own data as JSON (medicines, batches, parties, sales, purchases, transfers, prescriptions, attendance, orders, devices, layout, credits, license). The file is downloaded through the master key only.</p>' +
+      '<div style="display:flex;gap:8px;margin-bottom:12px"><input id="bakTenant" placeholder="Tenant ID" value="' + masterTenantId + '" style="flex:1;padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><button class="btn primary" id="bakDownload">Download export (JSON)</button></div><div id="bakResult"></div>' +
+      '<h3 style="margin-top:16px">Restore</h3><p>Coming soon — not built yet. Restore is not available in this slice, and no restore is claimed. Only the export above is functional.</p>';
+    document.querySelector('#bakDownload').addEventListener('click', async () => {
+      const t = document.querySelector('#bakTenant').value.trim(); if (!t) return alert('Enter a tenant ID first.'); masterTenantId = t;
+      try {
+        const key = sessionStorage.getItem('mbi_master_key');
+        const resp = await fetch('/api/master/tenants/' + encodeURIComponent(t) + '/export', { headers: { 'x-master-key': key } });
+        if (!resp.ok) throw new Error('Export failed');
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'tenant-' + t + '-export.json'; a.click(); URL.revokeObjectURL(url);
+        document.querySelector('#bakResult').innerHTML = '<p>Export downloaded.</p>';
+      } catch (err) { document.querySelector('#bakResult').innerHTML = '<p class="error">' + err.message + '</p>'; }
+    });
   }
 
   if (sessionStorage.getItem('mbi_master_key')) loadMasterTab();

@@ -287,6 +287,86 @@ export function buildRouter(store: Store): Router {
     return response.json({ tenantId: tenant.id, note: await masterRegistry.setSupportNote(tenant.id, body.data.note) });
   });
 
+  // Phase 5 remainder (Phase 5, /server only): subscriptions view derived
+  // from licenses + plan (no billing, no payment processing — payment
+  // collection is not built and is labelled as such in the panel),
+  // master-managed announcements, and per-tenant export.
+  router.get("/api/master/subscriptions", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    try {
+      const tenants = await store.listTenants();
+      const licenses = await masterRegistry.listLicenses({});
+      const byTenant = new Map(licenses.map((l) => [l.tenantId, l]));
+      const subscriptions = tenants.map((t) => {
+        const license = byTenant.get(t.id);
+        return { tenantId: t.id, tenantName: t.name, plan: t.plan, status: t.status, license: license ? { id: license.id, key: license.key, effectiveStatus: license.effectiveStatus, expiryDate: license.expiryDate, lifetime: license.lifetime } : null, paymentCollection: "not built" };
+      });
+      return response.json({ subscriptions });
+    } catch { return response.status(503).json({ error: "SUBSCRIPTION_FAILED" }); }
+  });
+  router.get("/api/master/announcements", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    return response.json({ announcements: await masterRegistry.listAnnouncementsAll() });
+  });
+  router.post("/api/master/announcements", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ tenantId: z.string().min(1).max(96).nullable().optional(), title: z.string().min(1).max(220), body: z.string().min(1).max(5000) }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    if (body.data.tenantId) {
+      const tenant = await store.getTenant(body.data.tenantId);
+      if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    }
+    return response.status(201).json({ announcement: await masterRegistry.createAnnouncement(body.data.tenantId ?? null, body.data.title, body.data.body) });
+  });
+  router.post("/api/master/announcements/:id/active", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const body = z.object({ active: z.boolean() }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT" });
+    const announcement = await masterRegistry.setAnnouncementActive(String(request.params.id), body.data.active);
+    if (!announcement) return response.status(404).json({ error: "ANNOUNCEMENT_NOT_FOUND" });
+    return response.json({ announcement });
+  });
+  router.get("/api/master/tenants/:tenantId/export", async (request, response) => {
+    if (!checkMasterKey(request, response)) return;
+    const tenant = await store.getTenant(String(request.params.tenantId));
+    if (!tenant) return response.status(404).json({ error: "TENANT_NOT_FOUND" });
+    const tenantId = tenant.id;
+    const data: Record<string, unknown> = { tenant, exportedAt: new Date().toISOString(), format: "mbi-inventra-tenant-export-v1", restore: "not built" };
+    const errors: string[] = [];
+    const section = async (name: string, fn: () => Promise<unknown>) => {
+      try { data[name] = await fn(); } catch { data[name] = null; errors.push(name); }
+    };
+    await section("dashboard", () => store.getDashboard(tenantId));
+    await section("medicines", async () => {
+      const medicines = await store.listMedicines(tenantId, "");
+      const batches: Record<string, unknown> = {};
+      for (const m of medicines) { try { batches[m.id] = await store.listBatches(tenantId, m.id); } catch { batches[m.id] = null; } }
+      return { medicines, batches };
+    });
+    await section("parties", async () => {
+      const parties = await store.listParties(tenantId);
+      const statements: unknown[] = [];
+      for (const p of parties) { try { statements.push(await store.getPartyBalance(tenantId, p.id)); } catch { statements.push(null); } }
+      return { parties, statements };
+    });
+    await section("sales", () => store.listSales(tenantId));
+    await section("purchases", () => store.listPurchases(tenantId));
+    await section("transfers", () => store.listTransfers(tenantId));
+    await section("prescriptions", () => store.listPrescriptions(tenantId));
+    await section("controlledLogs", () => store.listControlledLogs(tenantId));
+    await section("attendance", () => store.listAttendance(tenantId, {}));
+    await section("orders", () => store.listOnlineOrders(tenantId));
+    await section("devices", () => store.listDevices(tenantId));
+    await section("features", () => store.getTenantFeatures(tenantId));
+    await section("homeLayout", () => store.getHomeLayout(tenantId));
+    await section("aiCredits", () => store.getAiCredits(tenantId, tenant.plan));
+    await section("license", () => masterRegistry.getTenantLicense(tenantId));
+    data.sectionErrors = errors;
+    response.setHeader("content-type", "application/json; charset=utf-8");
+    response.setHeader("content-disposition", `attachment; filename=tenant-${tenantId}-export.json`);
+    return response.json(data);
+  });
+
   // Phase 5 slice 1 — Public registration. Owner decision after pushback:
   // anyone may register a pharmacy, but the guardrails stay: plan is forced
   // to Basic (Advanced is a master-panel upgrade, so public signups cannot
@@ -447,6 +527,12 @@ export function buildRouter(store: Store): Router {
 
   router.use("/api", requireAuth, tenantGuard(store));
 
+  // Tenant-visible announcements: only active announcements addressed
+  // to this tenant or to all tenants. The tenant never sees another
+  // tenant's targeted announcement.
+  router.get("/api/announcements", async (request: RequestContext, response) => {
+    return response.json({ announcements: await masterRegistry.listAnnouncementsForTenant(request.auth!.tenantId) });
+  });
   router.get("/api/me", async (request: RequestContext, response) => {
     const user = await store.getUser(request.auth!.sub); const tenant = response.locals.tenant;
     response.json({ user: user && { id: user.id, name: user.name, role: user.role, branchIds: user.branchIds, permissions: user.permissions }, tenant });

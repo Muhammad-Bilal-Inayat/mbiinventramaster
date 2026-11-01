@@ -64,6 +64,15 @@ export interface DomainRecord {
   verifiedAt: string | null;
 }
 
+export interface AnnouncementRecord {
+  id: string;
+  tenantId: string | null;
+  title: string;
+  body: string;
+  active: boolean;
+  createdAt: string;
+}
+
 const LICENSE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 export function generateLicenseKey(): string {
@@ -110,6 +119,7 @@ class MasterRegistry {
   private memoryAudit: AuditRecord[] = [];
   private memoryNotes = new Map<string, string>();
   private memoryDomains = new Map<string, DomainRecord>();
+  private memoryAnnouncements = new Map<string, AnnouncementRecord>();
   private registryPool: ReturnType<typeof mariadb.createPool> | null = null;
 
   private get isMariaDb(): boolean {
@@ -135,6 +145,7 @@ class MasterRegistry {
     const pool = this.pool();
     await pool.query("CREATE TABLE IF NOT EXISTS licenses (id VARCHAR(96) PRIMARY KEY, license_key VARCHAR(64) NOT NULL UNIQUE, tenant_id VARCHAR(64) NULL, plan ENUM('basic','advanced') NOT NULL DEFAULT 'basic', status ENUM('active','suspended','revoked') NOT NULL DEFAULT 'active', start_date DATE NULL, expiry_date DATE NULL, lifetime BOOLEAN NOT NULL DEFAULT FALSE, max_devices INT NULL, notes TEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_license_tenant (tenant_id)) ENGINE=InnoDB");
     await pool.query("CREATE TABLE IF NOT EXISTS master_support_notes (tenant_id VARCHAR(64) PRIMARY KEY, note TEXT NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB");
+    await pool.query("CREATE TABLE IF NOT EXISTS master_announcements (id VARCHAR(96) PRIMARY KEY, tenant_id VARCHAR(64) NULL, title VARCHAR(220) NOT NULL, body TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_announcement_tenant (tenant_id)) ENGINE=InnoDB");
     await pool.query("CREATE TABLE IF NOT EXISTS master_audit_logs (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, actor_id VARCHAR(96) NOT NULL, action VARCHAR(96) NOT NULL, tenant_id VARCHAR(64) NULL, metadata_json JSON NULL, ip_address VARCHAR(64) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_master_audit_tenant_time (tenant_id, created_at)) ENGINE=InnoDB");
   }
 
@@ -353,6 +364,50 @@ class MasterRegistry {
     const record: DomainRecord = { id: randomId("domain"), tenantId, hostname: host, verifiedAt: null };
     this.memoryDomains.set(record.id, record);
     await this.logAudit("domain.added", tenantId, { hostname: host });
+    return record;
+  }
+
+  async listAnnouncementsForTenant(tenantId: string): Promise<AnnouncementRecord[]> {
+    if (this.isMariaDb) {
+      await this.ensureTables();
+      const rows = await this.pool().query("SELECT id, tenant_id AS tenantId, title, body, active, created_at AS createdAt FROM master_announcements WHERE active = TRUE AND (tenant_id IS NULL OR tenant_id = ?) ORDER BY created_at DESC LIMIT 50", [tenantId]) as any[];
+      return rows.map((r: any) => ({ id: r.id, tenantId: r.tenantId ?? null, title: r.title, body: r.body, active: Boolean(r.active), createdAt: toIso(r.createdAt) }));
+    }
+    return [...this.memoryAnnouncements.values()].filter((a) => a.active && (a.tenantId === null || a.tenantId === tenantId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async listAnnouncementsAll(): Promise<AnnouncementRecord[]> {
+    if (this.isMariaDb) {
+      await this.ensureTables();
+      const rows = await this.pool().query("SELECT id, tenant_id AS tenantId, title, body, active, created_at AS createdAt FROM master_announcements ORDER BY created_at DESC LIMIT 200") as any[];
+      return rows.map((r: any) => ({ id: r.id, tenantId: r.tenantId ?? null, title: r.title, body: r.body, active: Boolean(r.active), createdAt: toIso(r.createdAt) }));
+    }
+    return [...this.memoryAnnouncements.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async createAnnouncement(tenantId: string | null, title: string, body: string): Promise<AnnouncementRecord> {
+    const record: AnnouncementRecord = { id: randomId("ann"), tenantId, title, body, active: true, createdAt: new Date().toISOString() };
+    if (this.isMariaDb) {
+      await this.ensureTables();
+      await this.pool().query("INSERT INTO master_announcements (id, tenant_id, title, body, active) VALUES (?, ?, ?, ?, TRUE)", [record.id, record.tenantId, record.title, record.body]);
+    } else {
+      this.memoryAnnouncements.set(record.id, record);
+    }
+    await this.logAudit("announcement.created", tenantId, { announcementId: record.id });
+    return record;
+  }
+
+  async setAnnouncementActive(id: string, active: boolean): Promise<AnnouncementRecord | undefined> {
+    if (this.isMariaDb) {
+      await this.ensureTables();
+      const result = await this.pool().query("UPDATE master_announcements SET active = ? WHERE id = ?", [active ? 1 : 0, id]) as { affectedRows?: number };
+      if (!result.affectedRows) return undefined;
+      const rows = await this.pool().query("SELECT id, tenant_id AS tenantId, title, body, active, created_at AS createdAt FROM master_announcements WHERE id = ? LIMIT 1", [id]) as any[];
+      return rows[0] ? { id: rows[0].id, tenantId: rows[0].tenantId ?? null, title: rows[0].title, body: rows[0].body, active: Boolean(rows[0].active), createdAt: toIso(rows[0].createdAt) } : undefined;
+    }
+    const record = this.memoryAnnouncements.get(id);
+    if (!record) return undefined;
+    record.active = active;
     return record;
   }
 
