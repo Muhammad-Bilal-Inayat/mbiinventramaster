@@ -4,6 +4,7 @@ import { allPermissionCodes, plans } from "./catalog.js";
 import { signAccessToken, verifyAccessToken, verifyPassword, type AccessClaims, deviceFingerprint } from "./security.js";
 import { provisionTenant } from "./provision.js";
 import { masterRegistry, isLicenseBlocked } from "./master.js";
+import { pushSyncRecords } from "./sync.js";
 import { chatWithGroq } from "./ai.js";
 import { DEFAULT_HOME_LAYOUT, type Store } from "./store.js";
 
@@ -923,15 +924,31 @@ export function buildRouter(store: Store): Router {
     return response.json({ accounting: await store.getAccounting(request.auth!.tenantId, filters) });
   });
 
-  // Phase 0 honesty fix: sync health must not return a random cursor, and
-  // sync push must not pretend a record was saved when it was not.
-  // Cursor-based offline sync storage lands in Phase 6. Until then, clients
-  // must keep records in their local queue when they see SYNC_NOT_IMPLEMENTED.
-  router.get("/api/sync/health", (request: RequestContext, response) => response.json({ ok: true, transport: "REST", tenantScoped: true, additive: true, cursor: null, cursorImplemented: false, tenantId: request.auth!.tenantId, lastSync: new Date().toISOString() }));
-  router.post("/api/sync/push", requirePermission("inventory.edit"), (request, response) => {
-    const idempotencyKey = request.header("x-idempotency-key");
-    if (!idempotencyKey) return response.status(400).json({ error: "IDEMPOTENCY_KEY_REQUIRED", message: "Send x-idempotency-key with every sync record. Records without it are never accepted." });
-    return response.status(501).json({ error: "SYNC_NOT_IMPLEMENTED", message: "Offline sync storage lands in Phase 6. Keep this record in the local queue; it was validated, not saved.", tenantId: (request as RequestContext).auth!.tenantId, idempotencyKey });
+  // Phase 6 real sync (stock adjustments only — see src/sync.ts for the
+  // rules). Sales, purchases and prescriptions are NOT synced yet.
+  router.get("/api/sync/health", async (request: RequestContext, response) => response.json({ ok: true, transport: "REST", tenantScoped: true, additive: true, syncedRecordTypes: ["stock_adjustment"], cursor: await store.getSyncCursor(request.auth!.tenantId), cursorImplemented: true, tenantId: request.auth!.tenantId, lastSync: new Date().toISOString() }));
+  router.get("/api/sync/pull", requirePermission("inventory.view"), async (request: RequestContext, response) => {
+    const cursorRaw = typeof request.query.cursor === "string" ? Number(request.query.cursor) : 0;
+    if (!Number.isInteger(cursorRaw) || cursorRaw < 0) return response.status(400).json({ error: "INVALID_CURSOR", message: "cursor must be a non-negative integer." });
+    const events = await store.listStockMovements(request.auth!.tenantId, cursorRaw, 200);
+    const newCursor = events.length ? events[events.length - 1].serverVersion : cursorRaw;
+    return response.json({ events, cursor: cursorRaw, newCursor, hasMore: events.length === 200 });
+  });
+  router.post("/api/sync/push", requirePermission("inventory.edit"), async (request: RequestContext, response) => {
+    const body = z.object({
+      baseCursor: z.number().int().min(0).nullable().optional(),
+      records: z.array(z.object({
+        idempotencyKey: z.string().min(1).max(160),
+        branchId: z.string().min(1),
+        batchId: z.string().min(1),
+        quantity: z.number().int().refine((n) => n !== 0),
+        movementType: z.enum(["adjust", "damage", "return"]),
+        referenceId: z.string().max(96).nullable().optional(),
+      })).min(1).max(100),
+    }).safeParse(request.body);
+    if (!body.success) return response.status(400).json({ error: "INVALID_INPUT", issues: body.error.flatten() });
+    const result = await pushSyncRecords(store, request.auth!.tenantId, request.auth!.sub, body.data.records, body.data.baseCursor ?? null, (branchId) => branchAccess(request as RequestContext, branchId));
+    return response.json({ tenantId: request.auth!.tenantId, ...result });
   });
 
   return router;

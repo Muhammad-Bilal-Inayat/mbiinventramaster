@@ -37,7 +37,7 @@ function widgetPanel(key, s) {
     return '<article class="card panel" ' + drag + '><div class="panel-head">' + handle + '<h2 class="panel-title">Recent activity</h2><span class="panel-note">Audit log</span></div>' + acts + '</article>';
   }
   if (key === 'command') {
-    return '<article class="card panel wide" ' + drag + '><div class="panel-head">' + handle + '<h2 class="panel-title">Your command center</h2><span class="panel-note">Function-level access enabled</span></div><div class="module-grid"><div class="module"><h3>Device security</h3><p>3-device sync, HWID binding, signed sessions and revoke controls are ready for this tenant.</p></div><div class="module"><h3>Tenant isolation</h3><p>All API requests resolve the signed tenant session. Client-provided tenant IDs are never trusted.</p></div><div class="module"><h3>Offline PWA</h3><p>PWA shell caching is ready. Offline sync storage is coming in Phase 6 - sync push currently returns 501 and does not save. Server transactions remain the source of truth.</p></div></div></article>';
+    return '<article class="card panel wide" ' + drag + '><div class="panel-head">' + handle + '<h2 class="panel-title">Your command center</h2><span class="panel-note">Function-level access enabled</span></div><div class="module-grid"><div class="module"><h3>Device security</h3><p>3-device sync, HWID binding, signed sessions and revoke controls are ready for this tenant.</p></div><div class="module"><h3>Tenant isolation</h3><p>All API requests resolve the signed tenant session. Client-provided tenant IDs are never trusted.</p></div><div class="module"><h3>Offline PWA</h3><p>Offline sync for stock adjustments is live in Phase 6: queue while offline, replay once by idempotency key when back online, server wins on conflict. Sales, purchases and prescriptions are not synced yet.</p></div></div></article>';
   }
   return '';
 }
@@ -66,6 +66,7 @@ async function renderApp() {
     try { const ann = await api('/api/announcements'); state.announcements = ann.announcements; } catch { state.announcements = []; }
     try { const l = await api('/api/home/layout'); state.homeLayout = l.layout; } catch { state.homeLayout = ["kpis", "branch", "alerts", "top", "activity", "command"]; }
     try { const c = await api('/api/ai/credits'); state.aiCredits = c.credits; } catch { state.aiCredits = null; }
+    if (navigator.onLine) { try { await syncQueueNow(); } catch (err) { /* queued records stay for a later sync */ } }
     document.querySelector('#app').innerHTML = appShell(); bindApp();
     const ct = document.querySelector('#aiCreditsText'); if (ct) ct.textContent = state.aiCredits ? (state.aiCredits.remaining + ' credits left') : 'Credits: -';
   } catch (error) { localStorage.removeItem('mbi_token'); state.token = null; loginView(error.message); }
@@ -103,6 +104,84 @@ async function loadAlerts() {
       a.expired.map(x => '<div class="activity"><span class="dot danger"></span><div><strong>' + x.medicineName + ' (' + x.batchNo + ')</strong><span>EXPIRED ' + x.expiryDate + ' - Qty ' + x.quantity + ' (do not sell)</span></div></div>').join('');
   } catch (error) { const box = document.querySelector('#invAlerts'); if (box) box.innerHTML = '<p class="error">' + error.message + '</p>'; }
 }
+function syncDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('mbi-inventra-sync', 1);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains('queue')) req.result.createObjectStore('queue', { keyPath: 'id', autoIncrement: true }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function syncQueueAdd(record) {
+  const db = await syncDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('queue', 'readwrite');
+    const req = tx.objectStore('queue').add(record);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function syncQueueList() {
+  const db = await syncDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction('queue', 'readonly').objectStore('queue').getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function syncQueueRemove(ids) {
+  const db = await syncDb();
+  return new Promise((resolve) => {
+    const tx = db.transaction('queue', 'readwrite');
+    ids.forEach(id => tx.objectStore('queue').delete(id));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+  });
+}
+async function syncQueueNow() {
+  if (!state.token) return { applied: 0, replayed: 0, errors: 0, conflicts: [] };
+  const queued = await syncQueueList();
+  if (!queued.length) return { applied: 0, replayed: 0, errors: 0, conflicts: [] };
+  const baseCursor = Number(localStorage.getItem('mbi_sync_cursor') || 0);
+  const data = await api('/api/sync/push', { method: 'POST', body: JSON.stringify({ baseCursor, records: queued.map(q => ({ idempotencyKey: q.idempotencyKey, branchId: q.branchId, batchId: q.batchId, quantity: q.quantity, movementType: q.movementType, referenceId: q.referenceId || null })) }) });
+  const done = new Map(data.results.map(r => [r.idempotencyKey, r.status]));
+  const doneIds = queued.filter(q => done.get(q.idempotencyKey) === 'applied' || done.get(q.idempotencyKey) === 'replayed').map(q => q.id);
+  await syncQueueRemove(doneIds);
+  if (data.newCursor) localStorage.setItem('mbi_sync_cursor', String(data.newCursor));
+  return data;
+}
+async function renderSync() {
+  const branches = state.me.tenant.branches.map(b => '<option value="' + b.id + '">' + b.name + '</option>').join('');
+  let health = null; let pending = 0;
+  try { health = await api('/api/sync/health'); } catch (e) { health = null; }
+  try { pending = (await syncQueueList()).length; } catch (e) { pending = 0; }
+  document.querySelector('#mainContent').innerHTML =
+    '<div class="topbar"><div><div class="eyebrow">SYNC HEALTH</div><h1 class="headline">Offline sync</h1><p class="subhead">Only stock adjustments sync offline in this phase. Sales, purchases and prescriptions are not synced yet. Server wins on conflict: if your offline view was stale, the server quantity is shown and your adjustment is applied on top of the current server stock.</p></div></div>' +
+    '<section class="card panel" style="margin-top:24px"><div class="panel-head"><h2 class="panel-title">Status</h2></div><p>Connection: <strong>' + (navigator.onLine ? 'Online' : 'Offline') + '</strong></p><p>Pending offline records in this browser: <strong id="syncPending">' + pending + '</strong></p><p>Server cursor: <strong>' + (health ? health.cursor : 'unknown') + '</strong></p><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" id="syncNowBtn">Sync now</button><button class="btn" id="syncPullBtn">Refresh from server</button></div><div id="syncResult" style="margin-top:12px"></div></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Queue a stock adjustment (works offline)</h2></div><form id="syncQueueForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><select name="branchId" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px">' + branches + '</select><input name="batchId" placeholder="Batch ID *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><input name="quantity" type="number" step="1" placeholder="Quantity (+ add, - remove, never 0) *" required style="padding:10px;border:1px solid #d9e2ec;border-radius:8px" /><select name="movementType" style="padding:10px;border:1px solid #d9e2ec;border-radius:8px"><option value="adjust">Adjust</option><option value="damage">Damage</option><option value="return">Return</option></select><button class="btn primary" type="submit">Queue adjustment</button></form><p style="font-size:12px;color:#627d98">Queued records are stored in this browser (IndexedDB) and replayed once, by idempotency key, when you sync. A retry never double-applies.</p></section>' +
+    '<section class="card panel" style="margin-top:16px"><div class="panel-head"><h2 class="panel-title">Queued records</h2></div><div id="syncQueueList"><p>Loading...</p></div></section>';
+  async function refreshQueueList() {
+    try {
+      const q = await syncQueueList();
+      document.querySelector('#syncPending').textContent = q.length;
+      document.querySelector('#syncQueueList').innerHTML = q.length ? q.map(r => '<div class="activity"><div><strong>' + r.movementType + ' ' + r.quantity + '</strong><span>Branch ' + r.branchId + ' - Batch ' + r.batchId + ' - Key ' + r.idempotencyKey + '</span></div></div>').join('') : '<p>No pending records.</p>';
+    } catch (e) { document.querySelector('#syncQueueList').innerHTML = '<p class="error">Offline queue is not available in this browser.</p>'; }
+  }
+  document.querySelector('#syncNowBtn').addEventListener('click', async () => {
+    try { const data = await syncQueueNow(); document.querySelector('#syncResult').innerHTML = '<p>Applied: ' + data.applied + ' - Replayed (already saved): ' + data.replayed + ' - Errors: ' + data.errors + (data.conflicts && data.conflicts.length ? ' - Conflicts (server won, refresh your view): ' + data.conflicts.map(c => c.idempotencyKey + ' → server qty ' + c.serverQuantity).join(', ') : '') + '</p>'; refreshQueueList(); } catch (err) { document.querySelector('#syncResult').innerHTML = '<p class="error">' + err.message + '</p>'; }
+  });
+  document.querySelector('#syncPullBtn').addEventListener('click', async () => {
+    try { const cursor = Number(localStorage.getItem('mbi_sync_cursor') || 0); const data = await api('/api/sync/pull?cursor=' + cursor); if (data.newCursor) localStorage.setItem('mbi_sync_cursor', String(data.newCursor)); document.querySelector('#syncResult').innerHTML = '<p>Pulled ' + data.events.length + ' stock movements since cursor ' + cursor + '. New cursor: ' + data.newCursor + '.</p>'; } catch (err) { document.querySelector('#syncResult').innerHTML = '<p class="error">' + err.message + '</p>'; }
+  });
+  document.querySelector('#syncQueueForm').addEventListener('submit', async (e) => {
+    e.preventDefault(); const f = Object.fromEntries(new FormData(e.target));
+    const record = { idempotencyKey: 'sync-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8), branchId: f.branchId, batchId: f.batchId, quantity: Number(f.quantity), movementType: f.movementType, referenceId: null, queuedAt: new Date().toISOString() };
+    try { await syncQueueAdd(record); e.target.reset(); refreshQueueList(); if (navigator.onLine) { try { await syncQueueNow(); refreshQueueList(); } catch (err) { /* stays queued, syncs later */ } } } catch (err) { alert(err.message); }
+  });
+  refreshQueueList();
+  window.addEventListener('online', async () => { try { if (state.token) await syncQueueNow(); } catch (err) { /* stays queued */ } });
+}
+
 async function renderInventory() {
   const branches = state.me.tenant.branches.map(b => '<option value="' + b.id + '">' + b.name + '</option>').join('');
   document.querySelector('#mainContent').innerHTML =
@@ -359,7 +438,7 @@ async function renderReports() {
 }
 
 function bindApp() {
-  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key === 'report') { renderReports(); } else if (key === 'prescriptions') { renderPrescriptions(); } else if (key === 'attendance') { renderAttendance(); } else if (key === 'orders') { renderOrders(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
+  document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', () => { document.querySelectorAll('.nav').forEach(x => x.classList.remove('active')); item.classList.add('active'); const key = item.dataset.page; if (key === 'inventory') { renderInventory(); } else if (key === 'sales') { renderSales(); } else if (key === 'purchases') { renderPurchases(); } else if (key === 'report') { renderReports(); } else if (key === 'prescriptions') { renderPrescriptions(); } else if (key === 'attendance') { renderAttendance(); } else if (key === 'orders') { renderOrders(); } else if (key === 'sync') { renderSync(); } else if (key !== 'home') { document.querySelector('#mainContent').innerHTML = `<div class="topbar"><div><div class="eyebrow">${key.toUpperCase()} MODULE</div><h1 class="headline">${item.textContent.trim()}</h1><p class="subhead">Coming soon — not built yet. No data is shown here until this module is built in a later phase.</p></div></div><section class="card panel" style="margin-top:24px"><div class="module-grid"><div class="module"><h3>What will be here</h3><p>This module will connect to MariaDB tables, transaction endpoints and the offline sync queue in its build phase. Until then this page shows nothing else.</p></div></div></section>`; } else { document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); }}));
   document.querySelector('#refresh')?.addEventListener('click', async () => { state.dashboard = await api('/api/dashboard'); document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); const toast = document.querySelector('#toast'); toast.textContent = 'Dashboard refreshed.'; toast.style.display = 'block'; setTimeout(() => { toast.style.display = 'none'; }, 2600); });
   document.querySelector('#resetLayout')?.addEventListener('click', async () => { try { const r = await api('/api/home/layout', { method: 'POST', body: JSON.stringify({ layout: ["kpis", "branch", "alerts", "top", "activity", "command"] }) }); state.homeLayout = r.layout; document.querySelector('#mainContent').innerHTML = dashboardHTML(); bindApp(); } catch (error) { alert(error.message); } });
   document.querySelectorAll('[data-widget]').forEach(el => {

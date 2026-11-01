@@ -236,6 +236,11 @@ export interface Store {
   listBatches(tenantId: string, medicineId: string): Promise<BatchRecord[]>;
   createBatch(tenantId: string, userId: string, input: { medicineId: string; batchNo: string; expiryDate: string; purchasePrice: number; salePrice: number }): Promise<BatchRecord>;
   adjustStock(tenantId: string, userId: string, input: { branchId: string; batchId: string; quantity: number; movementType: string; referenceId?: string | null; idempotencyKey: string; reorderLevel?: number }): Promise<StockMovementRecord>;
+  getMovementByKey(tenantId: string, idempotencyKey: string): Promise<StockMovementRecord | undefined>;
+  listStockMovements(tenantId: string, cursor: number, limit: number): Promise<StockMovementRecord[]>;
+  getBranchBatchCursor(tenantId: string, branchId: string, batchId: string): Promise<number>;
+  getBranchBatchQuantity(tenantId: string, branchId: string, batchId: string): Promise<number>;
+  getSyncCursor(tenantId: string): Promise<number>;
   getStockAlerts(tenantId: string): Promise<StockAlerts>;
   getFefoBatch(tenantId: string, medicineId: string, branchId: string): Promise<BatchRecord | undefined>;
   createParty(tenantId: string, input: { type: "customer" | "supplier"; name: string; phone?: string | null; address?: string | null }): Promise<PartyRecord>;
@@ -400,6 +405,7 @@ class MemoryStore implements Store {
   private stock = new Map<string, { quantity: number; reorderLevel: number }>();
   private movements: StockMovementRecord[] = [];
   private movementSeq = 0;
+  private movementTenants = new Map<string, string>();
   private parties = new Map<string, PartyRecord & { tenantId: string }>();
   private sales = new Map<string, SaleRecord & { tenantId: string }>();
   private purchases = new Map<string, PurchaseRecord & { tenantId: string }>();
@@ -605,7 +611,30 @@ class MemoryStore implements Store {
     this.movementSeq += 1;
     const movement: StockMovementRecord = { id: randomId("movement"), branchId: input.branchId, batchId: input.batchId, movementType: input.movementType, quantity: input.quantity, referenceId: input.referenceId ?? null, idempotencyKey: input.idempotencyKey, serverVersion: this.movementSeq };
     this.movements.push(movement);
+    this.movementTenants.set(movement.id, tenantId);
     return movement;
+  }
+  async getMovementByKey(tenantId: string, idempotencyKey: string) {
+    const movement = this.movements.find((m) => m.idempotencyKey === idempotencyKey);
+    if (!movement || this.movementTenants.get(movement.id) !== tenantId) return undefined;
+    return movement;
+  }
+  async listStockMovements(tenantId: string, cursor: number, limit: number) {
+    return this.movements.filter((m) => this.movementTenants.get(m.id) === tenantId && m.serverVersion > cursor).sort((a, b) => a.serverVersion - b.serverVersion).slice(0, limit);
+  }
+  async getBranchBatchCursor(tenantId: string, branchId: string, batchId: string) {
+    let max = 0;
+    for (const m of this.movements) if (this.movementTenants.get(m.id) === tenantId && m.branchId === branchId && m.batchId === batchId) max = Math.max(max, m.serverVersion);
+    return max;
+  }
+  async getBranchBatchQuantity(tenantId: string, branchId: string, batchId: string) {
+    void tenantId;
+    return this.stock.get(`${branchId}:${batchId}`)?.quantity ?? 0;
+  }
+  async getSyncCursor(tenantId: string) {
+    let max = 0;
+    for (const m of this.movements) if (this.movementTenants.get(m.id) === tenantId) max = Math.max(max, m.serverVersion);
+    return max;
   }
   async getStockAlerts(tenantId: string): Promise<StockAlerts> {
     const today = new Date().toISOString().slice(0, 10);
@@ -1437,6 +1466,36 @@ class MariaDbHealthStore implements Store {
     } finally {
       connection.release();
     }
+  }
+  async getMovementByKey(tenantId: string, idempotencyKey: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool);
+    const rows = await tenantPool.query("SELECT movement_uuid AS id, branch_id AS branchId, batch_id AS batchId, movement_type AS movementType, quantity, reference_id AS referenceId, idempotency_key AS idempotencyKey, server_version AS serverVersion FROM stock_movements WHERE idempotency_key = ? LIMIT 1", [idempotencyKey]) as any[];
+    return rows[0] as StockMovementRecord | undefined;
+  }
+  async listStockMovements(tenantId: string, cursor: number, limit: number) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool);
+    const rows = await tenantPool.query("SELECT movement_uuid AS id, branch_id AS branchId, batch_id AS batchId, movement_type AS movementType, quantity, reference_id AS referenceId, idempotency_key AS idempotencyKey, server_version AS serverVersion FROM stock_movements WHERE server_version > ? ORDER BY server_version ASC LIMIT ?", [cursor, limit]) as any[];
+    return rows as StockMovementRecord[];
+  }
+  async getBranchBatchCursor(tenantId: string, branchId: string, batchId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool);
+    const rows = await tenantPool.query("SELECT COALESCE(MAX(server_version), 0) AS maxVersion FROM stock_movements WHERE branch_id = ? AND batch_id = ?", [branchId, batchId]) as any[];
+    return Number(rows[0]?.maxVersion ?? 0);
+  }
+  async getBranchBatchQuantity(tenantId: string, branchId: string, batchId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool);
+    const rows = await tenantPool.query("SELECT quantity FROM branch_stock WHERE branch_id = ? AND batch_id = ? LIMIT 1", [branchId, batchId]) as any[];
+    return Number(rows[0]?.quantity ?? 0);
+  }
+  async getSyncCursor(tenantId: string) {
+    const tenantPool = await this.getTenantPool(tenantId);
+    await this.ensureInventoryTables(tenantPool);
+    const rows = await tenantPool.query("SELECT COALESCE(MAX(server_version), 0) AS maxVersion FROM stock_movements") as any[];
+    return Number(rows[0]?.maxVersion ?? 0);
   }
   async getStockAlerts(tenantId: string): Promise<StockAlerts> {
     const tenantPool = await this.getTenantPool(tenantId);
